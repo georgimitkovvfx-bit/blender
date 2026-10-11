@@ -132,12 +132,13 @@ void ApplyPrimvars(AttributeSet &attributes,
       }
       else {
         attrType = CCL_NS::TypeVector;
-        size = valueData.size() * sizeof(float3);
-        // The Cycles "float3" data type is padded to "float4", so need to convert the array
-        VtArray<float3> valueConverted;
+        /* Attributes store vectors as packed_float3 (12 bytes, Attribute::data_sizeof); copying padded float3
+         * (16 bytes) overflowed the attribute buffer and corrupted the heap. */
+        size = valueData.size() * sizeof(packed_float3);
+        VtArray<packed_float3> valueConverted;
         valueConverted.reserve(valueData.size());
         for (const GfVec3f &vec : valueData) {
-          valueConverted.push_back(make_float3(vec[0], vec[1], vec[2]));
+          valueConverted.push_back(packed_float3(make_float3(vec[0], vec[1], vec[2])));
         }
         data = valueConverted.data();
         value = std::move(valueConverted);
