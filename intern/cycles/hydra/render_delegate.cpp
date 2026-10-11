@@ -98,9 +98,7 @@ SessionParams GetSessionParams(const HdRenderSettingsMap &settings)
   for (const DeviceInfo &info :
        Device::available_devices(DEVICE_MASK(Device::type_from_string(deviceType.c_str()))))
   {
-    if (info.meets_driver_requirement) {
-      devices.push_back(info);
-    }
+    devices.push_back(info);
   }
   if (devices.empty()) {
     devices = Device::available_devices(DEVICE_MASK_CPU);
