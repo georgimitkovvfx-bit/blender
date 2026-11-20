@@ -230,6 +230,7 @@ void HdCyclesMaterial::Sync(HdSceneDelegate *sceneDelegate,
   }
 
   Initialize(renderParam);
+  _instanceIdAov = static_cast<HdCyclesSession *>(renderParam)->InstanceIdAov();
 
   const SceneLock lock(renderParam);
 
@@ -629,8 +630,8 @@ void HdCyclesMaterial::PopulateShaderGraph(HdMaterialNetworkSchema network)
     graph->connect(output, input);
   }
 
-  /* Create the instanceId AOV output. */
-  {
+  /* Create the instanceId AOV output (unless the host never reads it). */
+  if (_instanceIdAov) {
     const ustring instanceId(HdAovTokens->instanceId.GetString());
 
     OutputAOVNode *aovNode = graph->create_node<OutputAOVNode>();
