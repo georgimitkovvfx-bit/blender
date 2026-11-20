@@ -34,6 +34,11 @@ void HdCyclesVolume::Populate(HdSceneDelegate *sceneDelegate, HdDirtyBits dirtyB
 {
   Scene *const scene = (Scene *)_geom->get_owner();
 
+  /* Density per object-space unit, as a Blender volume (Volume › Render › Space: Object, its default): scaling a
+   * volume keeps its opacity. Cycles' own default (world space) made a volume scaled ×3 three times as dense as
+   * Blender renders the same USD. */
+  _geom->set_object_space(true);
+
   if (dirtyBits & HdChangeTracker::DirtyVolumeField) {
     const HdSceneIndexPrim prim = GetPrim(sceneDelegate, GetId());
     HdVolumeFieldBindingSchema bindings = HdVolumeFieldBindingSchema::GetFromParent(
