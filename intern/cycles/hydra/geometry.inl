@@ -257,7 +257,7 @@ void HdCyclesGeometry<Base, CyclesBase>::Sync(HdSceneDelegate *sceneDelegate,
    * under the lock again. Otherwise everything runs under one lock. */
   bool rebuild = false;
   const bool exclusive = static_cast<HdCyclesSession *>(renderParam)->ExclusiveSync();
-  std::optional<SceneLock> lock_holder(std::in_place, renderParam);
+  std::optional<SceneLock> lock_holder(std::in_place, renderParam, true);
   const SceneLock &lock = *lock_holder;
 
   if (materialDirty) {
@@ -368,7 +368,7 @@ void HdCyclesGeometry<Base, CyclesBase>::Finalize(HdRenderParam *renderParam)
     return;
   }
 
-  const SceneLock lock(renderParam);
+  const SceneLock lock(renderParam, true);
   const bool keep_nodes = static_cast<const HdCyclesSession *>(renderParam)->keep_nodes;
 
   static_cast<HdCyclesSession *>(renderParam)->RemoveLinkGeometry(this);
