@@ -684,7 +684,7 @@ void HdCyclesMaterial::Finalize(HdRenderParam *renderParam)
   _nodes.clear();
 
   if (!keep_nodes) {
-    lock.scene->delete_node(_shader);
+    static_cast<HdCyclesSession *>(renderParam)->RetireShader(lock.scene, _shader);
   }
   _shader = nullptr;
 }
@@ -697,7 +697,7 @@ void HdCyclesMaterial::Initialize(HdRenderParam *renderParam)
 
   const SceneLock lock(renderParam);
 
-  _shader = lock.scene->create_node<Shader>();
+  _shader = static_cast<HdCyclesSession *>(renderParam)->TakeShader(lock.scene);
 }
 
 HDCYCLES_NAMESPACE_CLOSE_SCOPE
