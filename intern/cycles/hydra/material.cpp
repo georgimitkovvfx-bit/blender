@@ -150,6 +150,10 @@ class UsdToCyclesTexture : public UsdToCyclesMapping {
         if (valueString == "repeat") {
           *value = VtValue(CyclesMaterialTokens->periodic);
         }
+        /* USD's default: the image's own wrap mode, black without one (Karma). Cycles reads none. */
+        else if (valueString == "useMetadata") {
+          *value = VtValue(TfToken("black"));
+        }
 
         return "extension";
       }
@@ -555,6 +559,8 @@ void HdCyclesMaterial::PopulateShaderGraph(HdMaterialNetworkSchema network)
         if (nodeTypeIdToken == CyclesMaterialTokens->UsdUVTexture) {
           /* USD's default sourceColorSpace is "auto"; Cycles' image node defaults to scene linear. */
           ApplyColorSpace(nodeDesc.node, TfToken("auto"));
+          /* USD's default wrap (useMetadata) is black outside the image, as Karma; Cycles' repeats. */
+          static_cast<ImageTextureNode *>(nodeDesc.node)->set_extension(EXTENSION_CLIP);
         }
         else if (nodeTypeIdToken == CyclesMaterialTokens->UsdPreviewSurface) {
           /* USD's defaults where Cycles' Principled BSDF has others (as hdCycles-h22): diffuseColor 0.18 (Cycles 0.8),
