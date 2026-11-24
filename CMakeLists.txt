@@ -2486,6 +2486,8 @@ if(WITH_BLENDER)
 elseif(WITH_CYCLES_STANDALONE OR WITH_CYCLES_HYDRA_RENDER_DELEGATE)
   add_subdirectory(intern/atomic)
   add_subdirectory(intern/guardedalloc)
+  # guardedalloc links bf::intern::profile (5.3).
+  add_subdirectory(intern/profile)
   add_subdirectory(intern/libc_compat)
   add_subdirectory(intern/sky)
 
