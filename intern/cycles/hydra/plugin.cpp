@@ -13,6 +13,10 @@
 #include <pxr/base/plug/thisPlugin.h>
 #include <pxr/base/tf/envSetting.h>
 #include <pxr/imaging/hd/rendererPluginRegistry.h>
+#if PXR_VERSION >= 2408
+#  include <pxr/imaging/hd/sceneIndexPluginRegistry.h>
+#  include <pxr/imaging/hdsi/velocityMotionResolvingSceneIndex.h>
+#endif
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -66,6 +70,25 @@ void HdCyclesPlugin::DeleteRenderDelegate(HdRenderDelegate *renderDelegate)
 {
   delete renderDelegate;
 }
+
+#if PXR_VERSION >= 2408
+/* velocities / accelerations / angular velocities → motion of points and instances over the shutter (UsdGeom's
+ * rules), for every host: husk and Houdini's viewport (Karma resolves them itself), usdview, Blender. The frame rate
+ * comes from the scene globals (husk's is 24; cycles_usd_render has its own), as in hdCycles-h22. */
+TF_REGISTRY_FUNCTION(HdSceneIndexPlugin)
+{
+  HdSceneIndexPluginRegistry::GetInstance().RegisterSceneIndexForRenderer(
+      "Cycles",
+      [](const std::string & /*renderInstanceId*/,
+         const HdSceneIndexBaseRefPtr &inputScene,
+         const HdContainerDataSourceHandle & /*inputArgs*/) -> HdSceneIndexBaseRefPtr {
+        return HdsiVelocityMotionResolvingSceneIndex::New(inputScene);
+      },
+      nullptr,
+      0,
+      HdSceneIndexPluginRegistry::InsertionOrderAtEnd);
+}
+#endif
 
 // USD's type system accounts for namespace, so we'd have to register our name as
 // HdCycles::HdCyclesPlugin in plugInfo.json, which isn't all that bad for JSON,
