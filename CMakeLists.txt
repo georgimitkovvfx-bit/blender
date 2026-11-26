@@ -601,6 +601,8 @@ option(WITH_CYCLES "Enable Cycles Render Engine" ON)
 option(WITH_CYCLES_OSL "Build Cycles with OpenShadingLanguage support" ON)
 option(WITH_CYCLES_PATH_GUIDING "Build Cycles with path guiding support" ON)
 option(WITH_CYCLES_EMBREE "Build Cycles with Embree support" ON)
+# Our Cycles (Cycles main) reads Blender 5.3's name for it.
+set(WITH_EMBREE ${WITH_CYCLES_EMBREE})
 option(WITH_CYCLES_DEBUG "Build Cycles with options useful for debugging (e.g., MIS)" OFF)
 
 option(WITH_CYCLES_STANDALONE "Build Cycles standalone application" OFF)
