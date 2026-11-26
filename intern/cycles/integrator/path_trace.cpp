@@ -164,7 +164,7 @@ void PathTrace::render(const RenderWork &render_work)
   /* Indicate that rendering has started and that it can be requested to cancel. */
   {
     const thread_scoped_lock lock(render_cancel_.mutex);
-    if (render_cancel_.is_requested) {
+    if (render_cancel_.is_requested || render_cancel_.is_held) {
       return;
     }
     render_cancel_.is_rendering = true;
@@ -177,7 +177,8 @@ void PathTrace::render(const RenderWork &render_work)
   {
     const thread_scoped_lock lock(render_cancel_.mutex);
     render_cancel_.is_rendering = false;
-    render_cancel_.condition.notify_one();
+    /* `cancel()` and `hold()` may both wait. */
+    render_cancel_.condition.notify_all();
   }
 }
 
@@ -794,14 +795,28 @@ void PathTrace::update_display(const RenderWork &render_work)
 
   const double start_time = time_dt();
 
-  if (output_driver_) {
+  /* Output drivers read full resolution tiles: skip the reduced resolution start of viewport
+   * renders, they keep the previous full resolution result until then. */
+  if (output_driver_ &&
+      render_state_.effective_big_tile_params.window_width == big_tile_params_.window_width &&
+      render_state_.effective_big_tile_params.window_height == big_tile_params_.window_height)
+  {
     LOG_DEBUG << "Invoke buffer update callback.";
 
     const PathTraceTile tile(*this);
     output_driver_->update_render_tile(tile);
   }
 
-  if (display_) {
+  if (display_ && display_->update_needed()) {
+    Device *const device = (big_tile_denoise_work_ && render_state_.has_denoised_result) ?
+                               big_tile_denoise_work_->get_device() :
+                               device_;
+    if (device->have_error()) {
+      /* Don't attempt to update GPU display if the device has errors: the error state will make
+       * wrong decisions to happen about interop, causing more chained bugs. */
+      return;
+    }
+
     LOG_DEBUG << "Perform copy to GPUDisplay work.";
 
     const PassType pass_type = film_->get_display_pass();
@@ -967,6 +982,46 @@ void PathTrace::cancel()
   if (display_) {
     display_->reset();
   }
+}
+
+void PathTrace::hold()
+{
+  thread_scoped_lock lock(render_cancel_.mutex);
+
+  render_cancel_.is_held = true;
+  render_cancel_.is_requested = true;
+
+  while (render_cancel_.is_rendering) {
+    render_cancel_.condition.wait(lock);
+  }
+
+  render_cancel_.is_requested = false;
+}
+
+void PathTrace::release_hold()
+{
+  {
+    const thread_scoped_lock lock(render_cancel_.mutex);
+    if (!render_cancel_.is_held) {
+      return;
+    }
+    render_cancel_.is_held = false;
+  }
+  render_cancel_.hold_condition.notify_all();
+}
+
+void PathTrace::wait_while_held()
+{
+  thread_scoped_lock lock(render_cancel_.mutex);
+  while (render_cancel_.is_held) {
+    render_cancel_.hold_condition.wait(lock);
+  }
+}
+
+bool PathTrace::is_held()
+{
+  const thread_scoped_lock lock(render_cancel_.mutex);
+  return render_cancel_.is_held;
 }
 
 int PathTrace::get_num_samples_in_buffer()
@@ -1179,10 +1234,8 @@ void PathTrace::process_full_buffer_from_disk(string_view filename)
     set_denoiser_params(denoise_params);
 
     /* Number of samples doesn't matter too much, since the samples count pass will be used. */
-    denoiser_->denoise_buffer(
+    render_state_.has_denoised_result = denoiser_->denoise_buffer(
         full_frame_buffers.params, full_frame_buffers.params, &full_frame_buffers, 0, false);
-
-    render_state_.has_denoised_result = true;
   }
 
   full_frame_state_.render_buffers = &full_frame_buffers;

@@ -458,6 +458,7 @@ enum PassType {
   PASS_BAKE_PRIMITIVE,
   PASS_BAKE_SEED,
   PASS_BAKE_DIFFERENTIAL,
+  PASS_BAKE_OBJECT,
   PASS_CATEGORY_BAKE_END = 127,
 
   PASS_DENOISING_PREVIOUS,
@@ -845,8 +846,10 @@ enum AttributeStandard : int {
 };
 
 enum AttributeFlag {
-  ATTR_SUBDIVIDE_SMOOTH_FVAR = (1 << 0), /* This attribute is face-varying and requires smooth
-                                          * subdivision (typically UV map). */
+  /* This attribute is face-varying and requires smooth subdivision (typically UV map). */
+  ATTR_SUBDIVIDE_SMOOTH_FVAR = (1 << 0),
+  /* Preserve linear interpolation when converting UVs from other domains to face-varying. */
+  ATTR_SUBDIVIDE_LINEAR_FVAR = (1 << 1),
 };
 
 struct AttributeDescriptor {
@@ -888,6 +891,9 @@ struct AttributeMap {
 #else
 #  define MAX_VOLUME_STACK_SIZE __MAX_VOLUME_STACK_SIZE__
 #endif
+
+/* Media of nested dielectrics a path can be inside of at once, plus the terminator. */
+#define MAX_DIELECTRIC_STACK_SIZE 4
 
 #define MAX_VOLUME_CLOSURE 8  // NOLINT
 /* Set the maximal resolution to be 128 (2^7) to limit traversing overhead. */
@@ -965,6 +971,9 @@ enum ShaderRuntimeFlag {
   SR_RAY_PORTAL = (1 << 12),
   /* BSDF has dispersion. */
   SR_BSDF_HAS_DISPERSION = (1 << 13),
+  /* Surface is inside a medium of higher volume stack priority, its dielectric closures are
+   * replaced by a transparent one (nested dielectrics). */
+  SR_PRIORITY_MASKED = (1 << 14),
 
   /* Flags that indicate the presence of closures. */
   SR_CLOSURE_FLAG = (SR_EMISSION | SR_BSDF | SR_BSDF_HAS_EVAL | SR_BSSRDF | SR_HOLDOUT |
@@ -1125,6 +1134,11 @@ struct ccl_align(SHADER_DATA_ALIGNMENT) ShaderData {
   float3 ray_P;
   float ray_dP;
 
+  /* Nested dielectrics: IOR of the medium on the other side of the surface, and absolute IOR of
+   * the dielectric closures of this surface (recorded when the path enters it). */
+  float opposite_ior;
+  float medium_ior;
+
   /* LCG state for closures that require additional random numbers. */
   uint lcg_state;
 #ifdef __SPECTRAL__
@@ -1219,8 +1233,8 @@ struct KernelCamera {
   /* motion blur */
   float shuttertime;
   int num_motion_steps, have_perspective_motion;
+  float motion_time_offset;
 
-  int pad1;
   int pad2;
   int pad3;
 
@@ -1398,6 +1412,12 @@ struct KernelBake {
   int object_index;
   int tri_offset;
   int use_camera;
+  /* Sizes of the object and triangle arrays, to validate the objects and triangles of the bake
+   * object pass, which the application writes. */
+  int num_objects;
+  int num_triangles;
+  int pad1;
+  int pad2;
 };
 static_assert_align(KernelBake, 16);
 
@@ -1730,7 +1750,8 @@ struct KernelShader {
   float cryptomatte_id;
   int flags;
   int pass_id;
-  int pad2, pad3;
+  int volume_stack_priority;
+  int pad3;
 };
 static_assert_align(KernelShader, 16);
 

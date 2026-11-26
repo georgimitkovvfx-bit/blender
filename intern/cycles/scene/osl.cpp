@@ -27,6 +27,10 @@
 #  include "util/projection.h"
 #  include "util/task.h"
 
+#  include <filesystem>
+#  include <iomanip>
+#  include <sstream>
+
 #endif
 
 CCL_NAMESPACE_BEGIN
@@ -179,7 +183,10 @@ static void optimize_group(OSLThreadInfoPool &thread_infos,
    * identifies the image manager in #OSLRenderServices::get_texture_handle(). */
   OSLRenderServices *services = static_cast<OSLRenderServices *>(ss->renderer());
   OSL::PerThreadInfo *thread_info = thread_infos.acquire(ss);
-  OSL::ShadingContext *context = ss->get_context(thread_info);
+  /* Dummy texture thread info like the render threads (OSLThreadData): there is no OSL texture
+   * system, which constant folding of gettextureinfo would ask for one. */
+  OSL::ShadingContext *context = ss->get_context(
+      thread_info, reinterpret_cast<OSL::TextureSystem::Perthread *>(1));
   services->image_manager_add(context, image_manager);
 
   ss->optimize_group(group, context, true);
@@ -374,6 +381,13 @@ void OSLManager::device_free(Device *device, DeviceScene * /*dscene*/, Scene *sc
 
   /* Remove any textures specific to an image manager from shared render services textures, since
    * the image manager may get destroyed next. */
+  free_textures(scene);
+}
+
+/* Shaders compiled next add their images again, also the files that texture() calls of script
+ * nodes read (looked up by file name), so files changed on disk are loaded again. */
+void OSLManager::free_textures(Scene *scene)
+{
   foreach_render_services([scene](OSLRenderServices *services) {
     for (auto it = services->textures.begin(); it != services->textures.end();) {
       if (it->first.image_manager == scene->image_manager.get()) {
@@ -586,9 +600,19 @@ const char *OSLManager::shader_load_filepath(string filepath)
   uint64_t modified_time = path_modified_time(filepath);
 
   if (extension == ".osl") {
-    /* .OSL File */
-    const string osopath = filepath.substr(0, len - 4) + ".oso";
-    const uint64_t oso_modified_time = path_modified_time(osopath);
+    /* .OSL File, compiled next to it, or in the temporary directory when that is not writable
+     * (e.g. installed example scripts). */
+    string osopath = filepath.substr(0, len - 4) + ".oso";
+    uint64_t oso_modified_time = path_modified_time(osopath);
+    MD5Hash md5;
+    md5.append(filepath);
+    const string temp_osopath = path_join(
+        path_join(std::filesystem::temp_directory_path().string(), "cycles_osl"),
+        md5.get_hex() + ".oso");
+    if (oso_modified_time < modified_time && path_modified_time(temp_osopath) >= modified_time) {
+      osopath = temp_osopath;
+      oso_modified_time = path_modified_time(osopath);
+    }
 
     /* test if we have loaded the corresponding .OSO already */
     if (oso_modified_time != 0) {
@@ -601,7 +625,11 @@ const char *OSLManager::shader_load_filepath(string filepath)
 
     /* Auto-compile .OSL to .OSO if needed. */
     if (oso_modified_time == 0 || (oso_modified_time < modified_time)) {
-      OSLManager::osl_compile(filepath, osopath);
+      if (!OSLManager::osl_compile(filepath, osopath) && osopath != temp_osopath) {
+        osopath = temp_osopath;
+        path_create_directories(osopath);
+        OSLManager::osl_compile(filepath, osopath);
+      }
       modified_time = path_modified_time(osopath);
     }
     else {
@@ -645,6 +673,50 @@ const char *OSLManager::shader_load_filepath(string filepath)
   return shader_load_bytecode(bytecode_hash, bytecode);
 }
 
+/* Attributes that a shader reads with getattribute(), when the name is a string constant or a
+ * string parameter: (parameter name or empty, name or parameter default). The node reads the
+ * parameter's own value, since the user sets the name there.
+ * shortcut: a name computed at run time or from a connected string parameter is not found (then
+ * another node must request the attribute, like in Blender); upgrade by asking OSL for the
+ * "attributes_needed" of the optimized shader group, if that becomes available in time. */
+static vector<pair<ustring, ustring>> oso_getattribute_names(const string &bytecode)
+{
+  map<string, pair<ustring, ustring>> strings;
+  vector<pair<ustring, ustring>> names;
+  std::istringstream lines(bytecode);
+  string line;
+  while (std::getline(lines, line)) {
+    std::istringstream tokens(line);
+    string op;
+    tokens >> op;
+    if (op == "const" || op == "param") {
+      /* E.g. const string $const1 "name" %read{1,1} %write{2147483647,-1} */
+      string type, symbol, value;
+      tokens >> type >> symbol >> std::ws;
+      if (type == "string" && tokens.peek() == '"' && tokens >> std::quoted(value)) {
+        strings[symbol] = {op == "param" ? ustring(symbol) : ustring(), ustring(value)};
+      }
+    }
+    else if (op == "getattribute") {
+      /* getattribute result [object] name [index] value %line{1} ..., the name is the last
+       * string argument. */
+      string arg;
+      pair<ustring, ustring> name;
+      tokens >> arg;
+      while (tokens >> arg && arg[0] != '%') {
+        const auto it = strings.find(arg);
+        if (it != strings.end()) {
+          name = it->second;
+        }
+      }
+      if (!name.first.empty() || !name.second.empty()) {
+        names.push_back(name);
+      }
+    }
+  }
+  return names;
+}
+
 const char *OSLManager::shader_load_bytecode(const string &hash, const string &bytecode)
 {
   foreach_shading_system(
@@ -659,9 +731,13 @@ const char *OSLManager::shader_load_bytecode(const string &hash, const string &b
   }
 
   /* this is a bit weak, but works */
-  info.has_surface_emission = (bytecode.find("\"emission\"") != string::npos);
-  info.has_surface_transparent = (bytecode.find("\"transparent\"") != string::npos);
-  info.has_surface_bssrdf = (bytecode.find("\"bssrdf\"") != string::npos);
+  info.has_surface_emission = (bytecode.find("\"emission\"") != string::npos ||
+                               bytecode.find("\"uniform_edf\"") != string::npos);
+  info.has_surface_transparent = (bytecode.find("\"transparent\"") != string::npos ||
+                                  bytecode.find("\"transparent_bsdf\"") != string::npos);
+  info.has_surface_bssrdf = (bytecode.find("\"bssrdf\"") != string::npos ||
+                             bytecode.find("\"subsurface_bssrdf\"") != string::npos);
+  info.attributes = oso_getattribute_names(bytecode);
 
   loaded_shaders[hash] = info;
 
@@ -966,6 +1042,9 @@ OSLNode *OSLShaderManager::osl_node(ShaderGraph *graph,
   else {
     node->filepath = filepath;
   }
+  node->requested_attributes = info->attributes;
+  node->has_bssrdf = info->has_surface_bssrdf;
+  node->has_transparent = info->has_surface_transparent;
 
   /* Generate inputs and outputs */
   node->create_inputs_outputs(node->type);
@@ -1626,6 +1705,12 @@ void OSLCompiler::compile(Shader *shader)
 
     current_shader = shader;
 
+    /* The textures of the previous compile hold their images until the render services are
+     * freed otherwise, also images the shader no longer uses (a changed file path). */
+    for (const ustring &texture : shader->osl_cache[device].textures) {
+      services->textures.erase({OSLUStringHash(texture), scene->image_manager.get()});
+    }
+
     Shader::OSLCache cache;
 
     if (shader->reference_count()) {
@@ -1643,6 +1728,7 @@ void OSLCompiler::compile(Shader *shader)
       }
     }
 
+    cache.textures = std::move(textures_);
     shader->osl_cache[device] = std::move(cache);
 
     /* Estimate emission for MIS. */
@@ -1659,6 +1745,7 @@ void OSLCompiler::parameter_texture(const char *name, const ImageHandle &handle)
   const ustring filename(string_printf("@svm%d", texture_shared_unique_id++).c_str());
   services->textures.insert({OSLUStringHash(filename), scene->image_manager.get()},
                             OSLTextureHandle(handle));
+  textures_.push_back(filename);
   parameter(name, filename);
 }
 
@@ -1668,6 +1755,7 @@ void OSLCompiler::parameter_texture_ies(const char *name, const int svm_slot)
   const ustring filename(string_printf("@svm%d", texture_shared_unique_id++).c_str());
   services->textures.insert({OSLUStringHash(filename), scene->image_manager.get()},
                             OSLTextureHandle(OSLTextureHandleType::IES, svm_slot));
+  textures_.push_back(filename);
   parameter(name, filename);
 }
 
@@ -1687,6 +1775,7 @@ void OSLManager::device_update_post(Device * /*device*/,
 {
 }
 void OSLManager::device_free(Device * /*device*/, DeviceScene * /*dscene*/, Scene * /*scene*/) {}
+void OSLManager::free_textures(Scene * /*scene*/) {}
 
 void OSLManager::tag_update() {}
 bool OSLManager::need_update() const

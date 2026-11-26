@@ -56,6 +56,10 @@ class SessionParams {
    * Zero means no limit is applied. */
   double time_limit;
 
+  /* Longest time in seconds between display updates of an interactive render.
+   * Zero lets the interval grow with the render time. */
+  double max_display_update_interval;
+
   bool use_profiling;
 
   bool use_auto_tile;
@@ -80,6 +84,7 @@ class SessionParams {
     pixel_size = 1;
     threads = 0;
     time_limit = 0.0;
+    max_display_update_interval = 0.0;
 
     use_profiling = false;
 
@@ -133,6 +138,12 @@ class Session {
   /* When quick cancel is requested path tracing is cancels as soon as possible, without waiting
    * for the buffer to be uniformly sampled. */
   void cancel(bool quick = false);
+
+  /* Keep the session thread from rendering (and from updating the device scene) while the host changes the scene,
+   * until `release_render_hold()`: see `PathTrace::hold()`. */
+  void hold_render();
+  void release_render_hold();
+  bool render_held();
 
   void draw();
   void wait();

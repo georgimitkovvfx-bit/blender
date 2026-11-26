@@ -25,6 +25,7 @@ class HdCyclesRenderBuffer;
 }  // namespace HD_CYCLES_NS
 
 namespace CCL_NS {
+class Attribute;
 class AttributeSet;
 class BufferParams;
 class Camera;
@@ -37,10 +38,12 @@ class ParticleSystem;
 class Pass;
 class PointCloud;
 class Scene;
+class SceneParams;
 class Session;
 class SessionParams;
 class Shader;
 class ShaderGraph;
+class ShaderInput;
 class ShaderNode;
 class Volume;
 }  // namespace CCL_NS

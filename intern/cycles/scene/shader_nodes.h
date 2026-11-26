@@ -1766,6 +1766,14 @@ class OSLNode final : public ShaderNode {
   {
     return has_emission;
   }
+  bool has_surface_bssrdf() override
+  {
+    return has_bssrdf;
+  }
+  bool has_surface_transparent() override
+  {
+    return has_transparent;
+  }
 
   /* Ideally we could better detect this, but we can't query this now. */
   bool has_spatial_varying() override
@@ -1789,6 +1797,12 @@ class OSLNode final : public ShaderNode {
   string filepath;
   string bytecode_hash;
   bool has_emission;
+  /* Closures in the byte code that need kernel features (subsurface, transparent shadows). */
+  bool has_bssrdf;
+  bool has_transparent;
+  /* Attributes the shader reads with getattribute(): (string parameter or empty, name or its
+   * default). */
+  vector<pair<ustring, ustring>> requested_attributes;
 };
 
 class NormalMapNode : public ShaderNode {
@@ -1938,11 +1952,20 @@ class RaycastNode : public ShaderNode {
 
   NODE_SOCKET_API(bool, only_local)
 
+  /* Nodes with different attribute outputs are not the same, which the inputs do not tell. */
+  bool equals(const ShaderNode &other) override
+  {
+    return ShaderNode::equals(other) &&
+           attribute_outputs_ == static_cast<const RaycastNode &>(other).attribute_outputs_;
+  }
+
  private:
   struct AttributeOutput {
     ustring attribute_name;
     AttributeOutputType attribute_output_type;
     ustring socket_id;
+
+    bool operator==(const AttributeOutput &other) const = default;
   };
   vector<AttributeOutput> attribute_outputs_;
 

@@ -5,8 +5,11 @@
 
 #include "hydra/mesh.h"
 #include "hydra/geometry.inl"
+#include "hydra/mesh_attributes.h"
 #include "hydra/util.h"
 #include "scene/mesh.h"
+
+#include <algorithm>
 
 #include <pxr/base/gf/vec2f.h>
 #include <pxr/imaging/hd/geomSubsetSchema.h>
@@ -21,6 +24,15 @@
 HDCYCLES_NAMESPACE_OPEN_SCOPE
 
 namespace {
+
+void RemoveUVTangents(AttributeSet &attributes, const ustring &name)
+{
+  for (const char *suffix :
+       {".tangent", ".tangent_sign", ".undisplaced_tangent", ".undisplaced_tangent_sign"})
+  {
+    attributes.remove(ustring(name.string() + suffix));
+  }
+}
 
 template<typename T>
 VtValue ComputeTriangulatedUniformPrimvar(VtValue value, const VtIntArray &primitiveParams)
@@ -57,6 +69,34 @@ VtValue ComputeTriangulatedUniformPrimvar(VtValue value,
   }
 }
 
+/* Cycles reads the UV map as float2 per face corner (mikktspace tangents, primitive_uv), so expand
+ * UVs at other interpolations to face-varying. */
+VtVec2fArray ComputeFaceVaryingUV(const VtVec2fArray &uv,
+                                  const HdInterpolation interpolation,
+                                  const HdMeshTopology &topology)
+{
+  if (interpolation == HdInterpolationFaceVarying) {
+    return uv;
+  }
+  const VtIntArray &counts = topology.GetFaceVertexCounts();
+  const VtIntArray &indices = topology.GetFaceVertexIndices();
+  VtVec2fArray result;
+  result.reserve(indices.size());
+  for (size_t face = 0, corner = 0; face < counts.size(); ++face) {
+    for (int i = 0; i < counts[face]; ++i, ++corner) {
+      const size_t index = (interpolation == HdInterpolationUniform)  ? face :
+                           (interpolation == HdInterpolationConstant) ? 0 :
+                           (corner < indices.size())                  ? size_t(indices[corner]) :
+                                                                        uv.size();
+      if (index >= uv.size()) {
+        return {};
+      }
+      result.push_back(uv[index]);
+    }
+  }
+  return result;
+}
+
 VtValue ComputeTriangulatedFaceVaryingPrimvar(VtValue value,
                                               const HdType valueType,
                                               HdMeshUtil &meshUtil)
@@ -72,6 +112,66 @@ VtValue ComputeTriangulatedFaceVaryingPrimvar(VtValue value,
   }
 
   return VtValue();
+}
+
+/* Pointiness and Random Per Island, which Blender's sync computes, when a shader reads them. Like
+ * Blender, on the control mesh of subdivision meshes, interpolated by the tessellation. */
+void PopulateIslandAttributes(Mesh *mesh,
+                              Scene *scene,
+                              const HdMeshTopology &topology,
+                              const VtIntArray &primitiveParams)
+{
+  const bool subdivision = mesh->get_subdivision_type() != Mesh::SUBDIVISION_NONE;
+  AttributeSet &attributes = subdivision ? mesh->subd_attributes : mesh->attributes;
+  attributes.remove(ATTR_STD_POINTINESS);
+  attributes.remove(ATTR_STD_RANDOM_PER_ISLAND);
+
+  const bool needPointiness = mesh->need_attribute(scene, ATTR_STD_POINTINESS);
+  const bool needIsland = mesh->need_attribute(scene, ATTR_STD_RANDOM_PER_ISLAND);
+  const Attribute *attr_P = attributes.find(ATTR_STD_POSITION);
+  if ((!needPointiness && !needIsland) || !attr_P) {
+    return;
+  }
+
+  const VtIntArray &counts = topology.GetFaceVertexCounts();
+  const VtIntArray &indices = topology.GetFaceVertexIndices();
+  const int numVerts = topology.GetNumPoints();
+  /* Topology from the scene: indices past the points would be read out of bounds. */
+  size_t numCorners = 0;
+  for (const int count : counts) {
+    numCorners += size_t(std::max(count, 0));
+  }
+  if (attr_P->size < numVerts || numCorners != indices.size() ||
+      std::ranges::any_of(counts, [](const int count) { return count < 0; }) ||
+      std::ranges::any_of(indices, [numVerts](const int v) { return v < 0 || v >= numVerts; }))
+  {
+    return;
+  }
+
+  const PolygonMesh polygons = {attr_P->data<packed_float3>(),
+                                numVerts,
+                                counts.data(),
+                                counts.size(),
+                                indices.data(),
+                                topology.GetOrientation() == HdTokens->leftHanded};
+
+  if (needPointiness) {
+    const std::vector<float> pointiness = compute_pointiness(polygons);
+    std::ranges::copy(pointiness, attributes.add(ATTR_STD_POINTINESS)->data_for_write<float>());
+  }
+  if (needIsland) {
+    const std::vector<float> island = compute_random_per_island(polygons);
+    float *data = attributes.add(ATTR_STD_RANDOM_PER_ISLAND)->data_for_write<float>();
+    if (subdivision) {
+      std::ranges::copy(island, data);
+    }
+    else {
+      /* Per triangle, from the polygon it was cut from. */
+      for (size_t i = 0; i < primitiveParams.size(); ++i) {
+        data[i] = island[HdMeshUtil::DecodeFaceIndexFromCoarseFaceParam(primitiveParams[i])];
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -134,6 +234,16 @@ HdDirtyBits HdCyclesMesh::_PropagateDirtyBits(HdDirtyBits bits) const
 
 void HdCyclesMesh::Populate(HdSceneDelegate *sceneDelegate, HdDirtyBits dirtyBits, bool &rebuild)
 {
+  /* Rebuild subdivision and displacement from the authored geometry when primvars change.
+   * Decided here, after the shaders synced, because displacement depends on shader state. */
+  if ((dirtyBits & HdChangeTracker::DirtyPrimvar) &&
+      (_geom->get_subdivision_type() != Mesh::SUBDIVISION_NONE || _geom->has_true_displacement() ||
+       IsAdaptiveSubdivision(sceneDelegate) != _adaptiveSubdivision))
+  {
+    dirtyBits |= HdChangeTracker::DirtyTopology | HdChangeTracker::DirtyPoints |
+                 HdChangeTracker::DirtyNormals;
+  }
+
   if (HdChangeTracker::IsTopologyDirty(dirtyBits, GetId())) {
     PopulateTopology(sceneDelegate);
   }
@@ -142,9 +252,17 @@ void HdCyclesMesh::Populate(HdSceneDelegate *sceneDelegate, HdDirtyBits dirtyBit
     PopulatePoints(sceneDelegate);
   }
 
-  // Must happen after topology update, so that normals attribute size can be calculated
-  if (dirtyBits & HdChangeTracker::DirtyNormals) {
+  // Must happen after topology update, so that normals attribute size can be calculated. Moved
+  // points need it too: Cycles computes the normals of meshes without authored ones only when
+  // the attribute is missing, and Hydra sends no DirtyNormals for them.
+  if (dirtyBits & (HdChangeTracker::DirtyNormals | HdChangeTracker::DirtyPoints)) {
     PopulateNormals(sceneDelegate);
+  }
+
+  /* Moved points change the pointiness, and shader changes resync the primvars. Before the
+   * primvars, which tag an attribute-only update. */
+  if (dirtyBits & (HdChangeTracker::DirtyPoints | HdChangeTracker::DirtyPrimvar)) {
+    PopulateIslandAttributes(_geom, (Scene *)_geom->get_owner(), _topology, _primitiveParams);
   }
 
   // Must happen after topology update, so that appropriate attribute set can be selected
@@ -169,23 +287,26 @@ void HdCyclesMesh::PopulatePoints(HdSceneDelegate *sceneDelegate)
     return;
   }
 
-  const auto &points = value.UncheckedGet<VtVec3fArray>();
+  const VtVec3fArray &points = value.UncheckedGet<VtVec3fArray>();
+  const size_t numPoints = _topology.GetNumPoints();
 
-  TF_VERIFY(points.size() >= static_cast<size_t>(_topology.GetNumPoints()));
+  TF_VERIFY(points.size() >= numPoints);
 
   const bool subdivision = _geom->get_subdivision_type() != Mesh::SUBDIVISION_NONE;
+  if (subdivision) {
+    /* Drop the previous tessellation, like the topology update: Mesh::tessellate takes every
+     * vertex of the mesh as a base vertex, and reads the positions past their end otherwise. */
+    _geom->clear_tessellation();
+  }
   AttributeSet &attributes = (subdivision) ? _geom->subd_attributes : _geom->attributes;
-  Attribute *attr_P = attributes.add(ATTR_STD_POSITION);
-  packed_float3 *verts = attr_P->data_for_write<packed_float3>();
-
-  std::copy_n(
-      reinterpret_cast<const packed_float3 *>(points.data()), _topology.GetNumPoints(), verts);
-  _geom->tag_position_modified();
+  SetPositions(attributes.add(ATTR_STD_POSITION), primvars, points, numPoints);
 }
 
 void HdCyclesMesh::PopulateNormals(HdSceneDelegate *sceneDelegate)
 {
   _geom->attributes.remove(ATTR_STD_VERTEX_NORMAL);
+  _geom->attributes.remove(ATTR_STD_CORNER_NORMAL);
+  _geom->subd_attributes.remove(ATTR_STD_VERTEX_NORMAL);
 
   // Authored normals should only exist on triangle meshes
   if (_geom->get_subdivision_type() != Mesh::SUBDIVISION_NONE) {
@@ -235,16 +356,21 @@ void HdCyclesMesh::PopulateNormals(HdSceneDelegate *sceneDelegate)
   else if (interpolation == HdInterpolationFaceVarying) {
     TF_VERIFY(normals.size() == static_cast<size_t>(_topology.GetNumFaceVaryings()));
 
-    // TODO: Cycles has no per-corner normals, so ignore until supported.
-#if 0
-    if (!_util.ComputeTriangulatedFaceVaryingPrimvar(
-            normals.data(), normals.size(), HdTypeFloatVec3, &value))
+    const VtValue triangulated = ComputeTriangulatedFaceVaryingPrimvar(
+        value, HdTypeFloatVec3, _util);
+    if (!triangulated.IsHolding<VtVec3fArray>() ||
+        triangulated.GetArraySize() != _geom->num_triangles() * 3)
     {
       return;
     }
+    const auto &cornerNormals = triangulated.UncheckedGet<VtVec3fArray>();
 
-    const auto &normalsTriangulated = value.UncheckedGet<VtVec3fArray>();
-#endif
+    packed_normal *const N =
+        _geom->attributes.add(ATTR_STD_CORNER_NORMAL)->data_for_write<packed_normal>();
+    for (size_t i = 0; i < cornerNormals.size(); ++i) {
+      N[i] = packed_normal(
+          make_float3(cornerNormals[i][0], cornerNormals[i][1], cornerNormals[i][2]));
+    }
   }
 }
 
@@ -255,8 +381,20 @@ void HdCyclesMesh::PopulatePrimvars(HdSceneDelegate *sceneDelegate)
   const bool subdivision = _geom->get_subdivision_type() != Mesh::SUBDIVISION_NONE;
   AttributeSet &attributes = subdivision ? _geom->subd_attributes : _geom->attributes;
 
+  /* Remove UVs before reading them again. */
+  while (const Attribute *previous = attributes.find(ATTR_STD_UV)) {
+    RemoveUVTangents(_geom->attributes, previous->name);
+    attributes.remove(previous->name);
+  }
+
   const HdSceneIndexPrim prim = GetPrim(sceneDelegate, GetId());
   const HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(prim.dataSource);
+  const TfToken uvName = FindUVPrimvar(primvars);
+  const size_t numPoints = ReadPrimvar(primvars, HdTokens->points).GetArraySize();
+  /* The bake UV map of the bake target, exported even when no shader reads it. */
+  const BakeSettings bake = _session->GetBake();
+  const TfToken bakeUVName = bake.object == GetId().GetString() ? TfToken(bake.uvMap) :
+                                                                  TfToken();
 
   const std::pair<HdInterpolation, AttributeElement> interpolations[] = {
       std::make_pair(HdInterpolationFaceVarying, ATTR_ELEMENT_CORNER),
@@ -273,61 +411,121 @@ void HdCyclesMesh::PopulatePrimvars(HdSceneDelegate *sceneDelegate)
         continue;
       }
 
-      VtValue value = ReadPrimvar(primvars, primvarName);
+      VtValue value = PrimvarAsFloats(ReadPrimvar(primvars, primvarName));
       if (value.IsEmpty()) {
         continue;
       }
 
-      const TfToken role = ReadPrimvarRole(primvars, primvarName);
-      const ustring name(primvarName.GetString());
-
-      AttributeStandard std = ATTR_STD_NONE;
-      if (role == HdPrimvarRoleTokens->textureCoordinate) {
-        std = ATTR_STD_UV;
-      }
-      else if (interpolation.first == HdInterpolationVertex) {
-        if (primvarName == HdTokens->displayColor || role == HdPrimvarRoleTokens->color) {
-          std = ATTR_STD_VERTEX_COLOR;
-        }
-        else if (primvarName == HdTokens->normals) {
-          std = ATTR_STD_VERTEX_NORMAL;
-        }
-      }
-      else if (primvarName == HdTokens->displayColor &&
-               interpolation.first == HdInterpolationConstant)
-      {
-        if (value.IsHolding<VtVec3fArray>() && value.GetArraySize() == 1) {
-          const GfVec3f color = value.UncheckedGet<VtVec3fArray>()[0];
-          _instances[0]->set_color(make_float3(color[0], color[1], color[2]));
-        }
+      const AttributeStandard std = PrimvarStandard(primvars, primvarName, uvName);
+      if (std == ATTR_STD_VERTEX_COLOR && interpolation.first == HdInterpolationConstant) {
+        SetInstanceColor(value);
       }
 
       // Skip attributes that are not needed
-      if ((std != ATTR_STD_NONE && _geom->need_attribute(scene, std)) ||
-          _geom->need_attribute(scene, name))
+      std::vector<ustring> names = RequestedPrimvarNames(
+          _geom, scene, primvars, primvarName, std);
+      const bool bakeUV = !bakeUVName.IsEmpty() && primvarName == bakeUVName;
+      if (bakeUV &&
+          std::find(names.begin(), names.end(), ustring(primvarName.GetString())) == names.end())
       {
-        const HdType valueType = HdGetValueTupleType(value).type;
+        names.emplace_back(primvarName.GetString());
+      }
+      if (names.empty()) {
+        continue;
+      }
 
-        if (!subdivision) {
-          // Adjust attributes for polygons that were triangulated
-          if (interpolation.first == HdInterpolationUniform) {
-            value = ComputeTriangulatedUniformPrimvar(value, valueType, _primitiveParams);
-            if (value.IsEmpty()) {
-              continue;
-            }
+      HdInterpolation primvarInterpolation = interpolation.first;
+      AttributeElement elem = interpolation.second;
+      /* The bake UV map is read like the UV map: float2 per face corner (bake.cpp). */
+      if (std == ATTR_STD_UV || bakeUV) {
+        const VtVec2fArray uv = ComputeFaceVaryingUV(
+            PrimvarAsFloat2(value), primvarInterpolation, _topology);
+        if (uv.empty()) {
+          continue;
+        }
+        value = uv;
+        primvarInterpolation = HdInterpolationFaceVarying;
+        elem = ATTR_ELEMENT_CORNER;
+      }
+
+      const HdType valueType = HdGetValueTupleType(value).type;
+
+      if (!subdivision) {
+        // Adjust attributes for polygons that were triangulated
+        if (primvarInterpolation == HdInterpolationUniform) {
+          /* Read per face, a short array would be read out of bounds. */
+          if (value.GetArraySize() != size_t(_topology.GetNumFaces())) {
+            TF_WARN("Primvar %s has %zu values, expected %d",
+                    primvarName.GetText(),
+                    value.GetArraySize(),
+                    _topology.GetNumFaces());
+            continue;
           }
-          else if (interpolation.first == HdInterpolationFaceVarying) {
-            value = ComputeTriangulatedFaceVaryingPrimvar(value, valueType, _util);
-            if (value.IsEmpty()) {
-              continue;
-            }
+          value = ComputeTriangulatedUniformPrimvar(value, valueType, _primitiveParams);
+          if (value.IsEmpty()) {
+            continue;
           }
         }
+        else if (primvarInterpolation == HdInterpolationFaceVarying) {
+          value = ComputeTriangulatedFaceVaryingPrimvar(value, valueType, _util);
+          if (value.IsEmpty()) {
+            continue;
+          }
+        }
+      }
 
-        ApplyPrimvars(attributes, name, value, interpolation.second, std);
+      /* A value for every point: the mesh only has the points up to the last one its faces use
+       * (Houdini keeps unused points after a Blast), the values of the others are left out. */
+      const bool unusedPoints = elem == ATTR_ELEMENT_VERTEX && value.GetArraySize() == numPoints;
+
+      const ustring ownName(primvarName.GetString());
+      for (const ustring &name : names) {
+        /* Recreate, in case the type, role or interpolation changed. */
+        if (Attribute *previous = attributes.find(name)) {
+          if (previous->std == ATTR_STD_NONE || previous->std == ATTR_STD_UV ||
+              previous->std == ATTR_STD_VERTEX_COLOR)
+          {
+            RemoveUVTangents(_geom->attributes, name);
+            attributes.remove(name);
+          }
+        }
+        ApplyPrimvars(
+            attributes, name, value, elem, name == ownName ? std : ATTR_STD_NONE, unusedPoints);
+        /* Copies of the UV map under other names subdivide smoothly like the UV map. */
+        Attribute *attr = (std == ATTR_STD_UV) ? attributes.find(name) : nullptr;
+        if (attr) {
+          attr->flags |= ATTR_SUBDIVIDE_SMOOTH_FVAR;
+        }
       }
     }
   }
+
+  /* Tangents are derived from UVs and may include named or fallback maps. */
+  for (const AttributeStandard std : {ATTR_STD_UV_TANGENT,
+                                      ATTR_STD_UV_TANGENT_SIGN,
+                                      ATTR_STD_UV_TANGENT_UNDISPLACED,
+                                      ATTR_STD_UV_TANGENT_SIGN_UNDISPLACED})
+  {
+    while (_geom->attributes.find(std)) {
+      _geom->attributes.remove(std);
+    }
+  }
+
+  if (!subdivision && !_geom->is_modified()) {
+    /* An attribute-only edit does not need a BVH update. */
+    _geom->add_vertex_normals();
+    _geom->update_tangents(scene, true);
+    _geom->update_tangents(scene, false);
+    _attributesChanged = true;
+  }
+}
+
+bool HdCyclesMesh::IsAdaptiveSubdivision(HdSceneDelegate *sceneDelegate) const
+{
+  const HdSceneIndexPrim prim = GetPrim(sceneDelegate, GetId());
+  return VtValue::Cast<bool>(GetObjectSetting(HdPrimvarsSchema::GetFromParent(prim.dataSource),
+                                              "use_adaptive_subdivision"))
+      .GetWithDefault(false);
 }
 
 void HdCyclesMesh::PopulateTopology(HdSceneDelegate *sceneDelegate)
@@ -346,6 +544,14 @@ void HdCyclesMesh::PopulateTopology(HdSceneDelegate *sceneDelegate)
   bool flatShadingEnabled = false;
   if (auto ds = displayStyleSchema.GetFlatShadingEnabled()) {
     flatShadingEnabled = ds->GetTypedValue(0.0f);
+  }
+  /* Uniform normals are one per face: the faces are flat, as USD means and Karma and Storm render them. Cycles
+   * computes face normals only for flat faces; smooth ones averaged the corners (a roof of two faces at 90°: 0.571
+   * with a 0.20 gradient across each face, Karma 0.446 flat). From hdcycles-blender patch 0017. */
+  if (ReadPrimvarInterpolation(HdPrimvarsSchema::GetFromParent(prim.dataSource), HdTokens->normals) ==
+      HdInterpolationUniform)
+  {
+    flatShadingEnabled = true;
   }
 
   const HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(prim.dataSource);
@@ -372,8 +578,44 @@ void HdCyclesMesh::PopulateTopology(HdSceneDelegate *sceneDelegate)
     holeIndices = ds->GetTypedValue(0.0f);
   }
 
-  _topology = HdMeshTopology(
-      scheme, orientation, faceVertexCounts, faceVertexIndices, holeIndices, refineLevel);
+  /* Blender's Adaptive Subdivision: Cycles dices the mesh to the dicing rate in pixels, up to
+   * the Max Subdivisions render setting, also without a refine level. Without it, the mesh is
+   * subdivided up to its refine level. */
+  const HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(prim.dataSource);
+  const bool adaptive = IsAdaptiveSubdivision(sceneDelegate);
+  _adaptiveSubdivision = adaptive;
+  /* Without the Cycles setting, Karma's Dicing Quality: quality 2 dices twice as finely, so half
+   * the dicing rate (approximate, Karma's micropolygon size is not specified in pixels). */
+  VtValue dicingRate = GetObjectSetting(primvars, "dicing_rate");
+  if (dicingRate.IsEmpty()) {
+    const float quality = VtValue::Cast<float>(
+                              ReadPrimvar(primvars, TfToken("karma:object:dicingquality")))
+                              .GetWithDefault(0.0f);
+    if (quality > 0.0f) {
+      dicingRate = VtValue(1.0f / quality);
+    }
+  }
+  const float dicingScale = std::max(
+      0.0f, VtValue::Cast<float>(dicingRate).GetWithDefault(1.0f));
+  if (adaptive) {
+    refineLevel = std::max(refineLevel, 1);
+    /* Houdini's SOP Import authors polygon meshes as "none": dice them flat (Blender's Simple
+     * subdivision), so displacement has vertices to move, like Karma dicing polygons. */
+    if (scheme == PxOsdOpenSubdivTokens->none) {
+      scheme = PxOsdOpenSubdivTokens->bilinear;
+    }
+  }
+
+  /* Use refinement only for supported subdivision meshes, so triangle indices
+   * and face-varying primvars agree about which holes to omit. */
+  const bool useSubdivision = refineLevel > 0 && (scheme == PxOsdOpenSubdivTokens->bilinear ||
+                                                  scheme == PxOsdOpenSubdivTokens->catmullClark);
+  _topology = HdMeshTopology(scheme,
+                             orientation,
+                             faceVertexCounts,
+                             faceVertexIndices,
+                             holeIndices,
+                             useSubdivision ? refineLevel : 0);
 
   /* Geom subsets are published as child prims of the mesh in the scene index. */
   HdGeomSubsets geomSubsetsList;
@@ -491,8 +733,8 @@ void HdCyclesMesh::PopulateTopology(HdSceneDelegate *sceneDelegate)
     _geom->tag_smooth_modified();
   }
   else {
-    const HdSubdivisionTagsSchema subdivSchema = HdSubdivisionTagsSchema::GetFromParent(
-        prim.dataSource);
+    /* The subdivision tags are in the mesh schema (mesh.subdivisionTags). */
+    const HdSubdivisionTagsSchema subdivSchema = meshSchema.GetSubdivisionTags();
     PxOsdSubdivTags subdivTags;
     if (auto ds = subdivSchema.GetInterpolateBoundary()) {
       subdivTags.SetVertexInterpolationRule(ds->GetTypedValue(0.0f));
@@ -585,24 +827,53 @@ void HdCyclesMesh::PopulateTopology(HdSceneDelegate *sceneDelegate)
                                    creaseWeights[creaseLengthOffset] :
                                    creaseWeights[createWeightOffset];
 
-          _geom->add_edge_crease(v0, v1, weight);
+          /* USD sharpness is OpenSubdiv's (10 = infinitely sharp), Cycles' crease is that / 10. */
+          _geom->add_edge_crease(v0, v1, weight / 10.0f);
         }
 
         indexOffset += creaseLength;
         creaseLengthOffset++;
       }
-
-      const VtIntArray cornerIndices = subdivTags.GetCornerIndices();
-      const VtFloatArray cornerWeights = subdivTags.GetCornerWeights();
-
-      for (size_t i = 0; i < cornerIndices.size(); ++i) {
-        _geom->add_vertex_crease(cornerIndices[i], cornerWeights[i]);
-      }
     }
 
-    _geom->set_subd_dicing_rate(1.0f);
-    _geom->set_subd_max_level(_topology.GetRefineLevel());
-    _geom->set_subd_objecttoworld(_instances[0]->get_tfm());
+    /* Corners also without edge creases. */
+    const VtIntArray cornerIndices = subdivTags.GetCornerIndices();
+    const VtFloatArray cornerWeights = subdivTags.GetCornerWeights();
+    for (size_t i = 0; i < std::min(cornerIndices.size(), cornerWeights.size()); ++i) {
+      _geom->add_vertex_crease(cornerIndices[i], cornerWeights[i] / 10.0f);
+    }
+
+    /* Boundary and face-varying rules, with the USD fallbacks when not authored. */
+    const TfToken boundary = subdivTags.GetVertexInterpolationRule();
+    _geom->set_subdivision_boundary_interpolation(
+        boundary == PxOsdOpenSubdivTokens->none     ? Mesh::SUBDIVISION_BOUNDARY_NONE :
+        boundary == PxOsdOpenSubdivTokens->edgeOnly ? Mesh::SUBDIVISION_BOUNDARY_EDGE_ONLY :
+                                                      Mesh::SUBDIVISION_BOUNDARY_EDGE_AND_CORNER);
+    const TfToken fvar = subdivTags.GetFaceVaryingInterpolationRule();
+    _geom->set_subdivision_fvar_interpolation(
+        fvar == PxOsdOpenSubdivTokens->none         ? Mesh::SUBDIVISION_FVAR_LINEAR_NONE :
+        fvar == PxOsdOpenSubdivTokens->cornersOnly  ? Mesh::SUBDIVISION_FVAR_LINEAR_CORNERS_ONLY :
+        fvar == PxOsdOpenSubdivTokens->cornersPlus2 ? Mesh::SUBDIVISION_FVAR_LINEAR_CORNERS_PLUS2 :
+        fvar == PxOsdOpenSubdivTokens->boundaries   ? Mesh::SUBDIVISION_FVAR_LINEAR_BOUNDARIES :
+        fvar == PxOsdOpenSubdivTokens->all          ? Mesh::SUBDIVISION_FVAR_LINEAR_ALL :
+                                                      Mesh::SUBDIVISION_FVAR_LINEAR_CORNERS_PLUS1);
+
+    /* Diced in pixels of the dicing camera (the render camera, HdCyclesRenderPass). */
+    const HdCyclesSession::DicingSettings &dicing = _session->GetDicing();
+    _geom->set_subd_adaptive_space(Mesh::SUBDIVISION_ADAPTIVE_SPACE_PIXEL);
+    if (adaptive) {
+      // Like Blender, at least 0.1 pixels
+      _geom->set_subd_dicing_rate(std::max(
+          0.1f, (_session->IsViewport() ? dicing.previewRate : dicing.rate) * dicingScale));
+      _geom->set_subd_max_level(dicing.maxLevel);
+    }
+    else {
+      _geom->set_subd_dicing_rate(1.0f);
+      _geom->set_subd_max_level(_topology.GetRefineLevel());
+    }
+    if (!_instances.empty()) {
+      _geom->set_subd_objecttoworld(_instances[0]->get_tfm());
+    }
   }
 }
 

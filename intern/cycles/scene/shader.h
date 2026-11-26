@@ -76,6 +76,9 @@ class Shader : public Node {
   unique_ptr<ShaderGraph> graph;
 
   NODE_SOCKET_API(int, pass_id)
+  /* Nested dielectrics: inside a medium of higher priority, the dielectric closures of this
+   * shader are skipped. 0 disables it. */
+  NODE_SOCKET_API(int, volume_stack_priority)
 
   /* sampling */
   NODE_SOCKET_API(EmissionSampling, emission_sampling_method)
@@ -143,6 +146,8 @@ class Shader : public Node {
     OSL::ShaderGroupRef bump;
     OSL::ShaderGroupRef displacement;
     OSL::ShaderGroupRef volume;
+    /* Textures the compile added to the render services, which hold their images. */
+    vector<ustring> textures;
   };
   map<Device *, OSLCache> osl_cache;
 #endif

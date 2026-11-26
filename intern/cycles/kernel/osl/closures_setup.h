@@ -46,6 +46,23 @@ ccl_device_forceinline void osl_zero_albedo(float3 *layer_albedo)
   }
 }
 
+/* Nested dielectrics, see bsdf_dielectric_priority_masked(). A masked closure also covers the
+ * layers below it, so that the skipped surface is fully transparent. */
+ccl_device_forceinline bool osl_closure_priority_masked(ccl_private ShaderData *sd,
+                                                        const uint32_t path_flag,
+                                                        const float3 weight,
+                                                        const float ior,
+                                                        float3 *layer_albedo)
+{
+  if (!bsdf_dielectric_priority_masked(sd, rgb_to_spectrum(weight), path_flag, ior)) {
+    return false;
+  }
+  if (layer_albedo != nullptr) {
+    *layer_albedo = weight;
+  }
+  return true;
+}
+
 ccl_device_forceinline bool osl_closure_skip(KernelGlobals kg,
                                              const PathRayVisibility path_visibility,
                                              const int scattering)
@@ -213,11 +230,14 @@ ccl_device void osl_closure_reflection_setup(KernelGlobals kg,
 ccl_device void osl_closure_refraction_setup(KernelGlobals kg,
                                              ccl_private ShaderData *sd,
                                              const PathRayVisibility path_visibility,
-                                             const uint32_t /*path_flag*/,
+                                             const uint32_t path_flag,
                                              const float3 weight,
                                              const ccl_private RefractionClosure *closure,
-                                             float3 * /*layer_albedo*/)
+                                             float3 *layer_albedo)
 {
+  if (osl_closure_priority_masked(sd, path_flag, weight, closure->ior, layer_albedo)) {
+    return;
+  }
   if (osl_closure_skip(kg, path_visibility, LABEL_SINGULAR)) {
     return;
   }
@@ -231,7 +251,8 @@ ccl_device void osl_closure_refraction_setup(KernelGlobals kg,
   const bool backfacing = (sd->runtime_flag & SR_BACKFACING);
 
   bsdf->N = maybe_ensure_valid_specular_reflection(sd, safe_normalize_fallback(closure->N, sd->N));
-  bsdf->ior = backfacing ? 1.0f / closure->ior : closure->ior;
+  const float ior = closure->ior / sd->opposite_ior;
+  bsdf->ior = backfacing ? 1.0f / ior : ior;
   bsdf->alpha_x = bsdf->alpha_y = 0.0f;
 
   sd->runtime_flag |= bsdf_microfacet_ggx_refraction_setup(bsdf);
@@ -274,12 +295,18 @@ ccl_device void osl_closure_ray_portal_bsdf_setup(KernelGlobals /*kg*/,
 ccl_device void osl_closure_coat_bsdf_setup(KernelGlobals kg,
                                             ccl_private ShaderData *sd,
                                             const PathRayVisibility path_visibility,
-                                            const uint32_t /*path_flag*/,
+                                            const uint32_t path_flag,
                                             const float3 weight,
                                             const ccl_private CoatBSDFClosure *closure,
                                             float3 *layer_albedo)
 {
   osl_zero_albedo(layer_albedo);
+
+  /* Nested dielectrics: masked with its surface (as the SVM Principled BSDF's coat), and its IOR
+   * relative to the medium outside, at least 1. Records no medium IOR. */
+  if (osl_closure_priority_masked(sd, path_flag, weight, 0.0f, layer_albedo)) {
+    return;
+  }
 
   if (osl_closure_skip(kg, path_visibility, LABEL_GLOSSY | LABEL_REFLECT)) {
     return;
@@ -287,7 +314,8 @@ ccl_device void osl_closure_coat_bsdf_setup(KernelGlobals kg,
 
   Coat coat;
   coat.tint = rgb_to_spectrum(closure->color);
-  coat.ior = closure->ior;
+  coat.ior = (sd->opposite_ior != 1.0f) ? fmaxf(closure->ior / sd->opposite_ior, 1.0f) :
+                                          closure->ior;
   coat.N = maybe_ensure_valid_specular_reflection(sd, safe_normalize_fallback(closure->N, sd->N));
   coat.roughness = closure->roughness;
   coat.weight = rgb_to_spectrum(weight);
@@ -302,12 +330,22 @@ ccl_device void osl_closure_coat_bsdf_setup(KernelGlobals kg,
 ccl_device void osl_closure_dielectric_bsdf_setup(KernelGlobals kg,
                                                   ccl_private ShaderData *sd,
                                                   const PathRayVisibility path_visibility,
-                                                  const uint32_t /*path_flag*/,
+                                                  const uint32_t path_flag,
                                                   const float3 weight,
                                                   const ccl_private DielectricBSDFClosure *closure,
                                                   float3 *layer_albedo)
 {
   osl_zero_albedo(layer_albedo);
+
+  /* Only a transmitting closure records the medium IOR, not a coat or specular layer. */
+  if (osl_closure_priority_masked(sd,
+                                  path_flag,
+                                  weight,
+                                  is_zero(closure->transmission_tint) ? 0.0f : closure->ior,
+                                  layer_albedo))
+  {
+    return;
+  }
 
   if (osl_closure_skip(kg, path_visibility, LABEL_GLOSSY | LABEL_REFLECT)) {
     return;
@@ -331,7 +369,8 @@ ccl_device void osl_closure_dielectric_bsdf_setup(KernelGlobals kg,
   bsdf->N = maybe_ensure_valid_specular_reflection(sd, safe_normalize_fallback(closure->N, sd->N));
   bsdf->alpha_x = closure->alpha_x;
   bsdf->alpha_y = closure->alpha_y;
-  bsdf->ior = backfacing ? 1.0f / closure->ior : closure->ior;
+  const float ior = closure->ior / sd->opposite_ior;
+  bsdf->ior = backfacing ? 1.0f / ior : ior;
   bsdf->T = closure->T;
 
   const bool beckmann = closure->distribution == make_string("beckmann", 14712237670914973463ull);
@@ -408,7 +447,7 @@ ccl_device void osl_closure_generalized_schlick_bsdf_setup(
     KernelGlobals kg,
     ccl_private ShaderData *sd,
     const PathRayVisibility path_visibility,
-    const uint32_t /*path_flag*/,
+    const uint32_t path_flag,
     const float3 weight,
     const ccl_private GeneralizedSchlickBSDFClosure *closure,
     float3 *layer_albedo)
@@ -417,6 +456,24 @@ ccl_device void osl_closure_generalized_schlick_bsdf_setup(
 
   const bool has_reflection = !is_zero(closure->reflection_tint);
   const bool has_transmission = !is_zero(closure->transmission_tint);
+
+  /* A negative exponent is the real IOR (trick for the Principled BSDF), else it comes from F0.
+   * Only a real IOR or a transmitting closure describes a medium: an F0 only reflection (metals,
+   * F82, specular workflows) keeps its IOR and records none. */
+  const bool medium = has_transmission || closure->exponent < 0.0f;
+  const float absolute_ior = (closure->exponent < 0.0f) ? -closure->exponent :
+                                                          ior_from_F0(average(closure->f0));
+  if (osl_closure_priority_masked(
+          sd, path_flag, weight, medium ? absolute_ior : 0.0f, layer_albedo))
+  {
+    return;
+  }
+  const float relative_ior = medium ? absolute_ior / sd->opposite_ior : absolute_ior;
+  /* F0 for the relative IOR, keeping the tint of the closure's F0. */
+  const float absolute_F0 = F0_from_ior(absolute_ior);
+  const float f0_scale = (relative_ior != absolute_ior && absolute_F0 > 0.0f) ?
+                             F0_from_ior(relative_ior) / absolute_F0 :
+                             1.0f;
 
   int label = LABEL_GLOSSY | LABEL_REFLECT;
   if (has_transmission) {
@@ -451,12 +508,11 @@ ccl_device void osl_closure_generalized_schlick_bsdf_setup(
      * to the F0...F90 range, this allows us to use the real IOR.
      * Computing it back from F0 might give a different result in case of specular
      * tinting. */
-    const float ior = backfacing ? 1.0f / -closure->exponent : -closure->exponent;
+    const float ior = backfacing ? 1.0f / relative_ior : relative_ior;
     bsdf->ior = bsdf_glass_ior(sd, ior, closure->inv_abbe);
   }
   else {
-    const float ior = ior_from_F0(average(closure->f0));
-    bsdf->ior = backfacing ? 1.0f / ior : ior;
+    bsdf->ior = backfacing ? 1.0f / relative_ior : relative_ior;
   }
 
   bool preserve_energy = false;
@@ -497,9 +553,9 @@ ccl_device void osl_closure_generalized_schlick_bsdf_setup(
                                                     zero_spectrum();
   fresnel->tint.transmittance = refractive_caustics ? rgb_to_spectrum(closure->transmission_tint) :
                                                       zero_spectrum();
-  fresnel->f0 = rgb_to_spectrum(closure->f0);
+  fresnel->f0 = rgb_to_spectrum(closure->f0) * f0_scale;
   fresnel->f90 = rgb_to_spectrum(closure->f90);
-  fresnel->exponent = closure->exponent;
+  fresnel->exponent = (closure->exponent < 0.0f) ? -relative_ior : closure->exponent;
   fresnel->thin_film.thickness = closure->thinfilm_thickness;
   fresnel->thin_film.ior = closure->thinfilm_ior;
   if (backfacing) {
@@ -596,12 +652,18 @@ ccl_device void osl_closure_thin_subsurface_setup(KernelGlobals kg,
 ccl_device void osl_closure_microfacet_setup(KernelGlobals kg,
                                              ccl_private ShaderData *sd,
                                              const PathRayVisibility path_visibility,
-                                             const uint32_t /*path_flag*/,
+                                             const uint32_t path_flag,
                                              const float3 weight,
                                              const ccl_private MicrofacetClosure *closure,
                                              float3 *layer_albedo)
 {
   osl_zero_albedo(layer_albedo);
+
+  if (osl_closure_priority_masked(
+          sd, path_flag, weight, closure->refract ? closure->ior : 0.0f, layer_albedo))
+  {
+    return;
+  }
 
   const int label = (closure->refract) ? LABEL_TRANSMIT : LABEL_REFLECT;
   if (osl_closure_skip(kg, path_visibility, LABEL_GLOSSY | label)) {
@@ -619,7 +681,8 @@ ccl_device void osl_closure_microfacet_setup(KernelGlobals kg,
   bsdf->N = maybe_ensure_valid_specular_reflection(sd, safe_normalize_fallback(closure->N, sd->N));
   bsdf->alpha_x = closure->alpha_x;
   bsdf->alpha_y = closure->alpha_y;
-  bsdf->ior = backfacing ? 1.0f / closure->ior : closure->ior;
+  const float ior = closure->ior / sd->opposite_ior;
+  bsdf->ior = backfacing ? 1.0f / ior : ior;
   bsdf->T = closure->T;
 
   /* Beckmann */
@@ -723,11 +786,14 @@ ccl_device void osl_closure_microfacet_multi_ggx_glass_setup(
     KernelGlobals kg,
     ccl_private ShaderData *sd,
     const PathRayVisibility path_visibility,
-    const uint32_t /*path_flag*/,
+    const uint32_t path_flag,
     const float3 weight,
     const ccl_private MicrofacetMultiGGXGlassClosure *closure,
-    float3 * /*layer_albedo*/)
+    float3 *layer_albedo)
 {
+  if (osl_closure_priority_masked(sd, path_flag, weight, closure->ior, layer_albedo)) {
+    return;
+  }
   /* Technically, the MultiGGX closure may also transmit. However,
    * since this is set statically and only used for caustic flags, this
    * is probably as good as it gets. */
@@ -746,7 +812,8 @@ ccl_device void osl_closure_microfacet_multi_ggx_glass_setup(
   bsdf->N = maybe_ensure_valid_specular_reflection(sd, safe_normalize_fallback(closure->N, sd->N));
   bsdf->alpha_x = closure->alpha_x;
   bsdf->alpha_y = bsdf->alpha_x;
-  bsdf->ior = backfacing ? 1.0f / closure->ior : closure->ior;
+  const float ior = closure->ior / sd->opposite_ior;
+  bsdf->ior = backfacing ? 1.0f / ior : ior;
 
   bsdf->T = zero_float3();
 
@@ -912,6 +979,10 @@ ccl_device void osl_closure_emission_setup(KernelGlobals kg,
       return;
     }
     weight *= object_volume_density(kg, sd->object);
+  }
+  else if (sd->runtime_flag & SR_PRIORITY_MASKED) {
+    /* A surface masked by a nested dielectric emits nothing, as in SVM. */
+    return;
   }
   emission_setup(sd, rgb_to_spectrum(weight));
 }
