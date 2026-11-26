@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0 */
 
 #include "hydra/plugin.h"
+#include "hydra/implicit_mesh.h"
 #include "hydra/render_delegate.h"
+#include "hydra/scene_indices.h"
 #include "util/log.h"
 #include "util/path.h"
 
@@ -13,6 +15,11 @@
 #include <pxr/base/plug/thisPlugin.h>
 #include <pxr/base/tf/envSetting.h>
 #include <pxr/imaging/hd/rendererPluginRegistry.h>
+#if PXR_VERSION >= 2408
+#  include <pxr/imaging/hd/retainedDataSource.h>
+#  include <pxr/imaging/hd/sceneIndexPluginRegistry.h>
+#  include <pxr/imaging/hd/tokens.h>
+#endif
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -33,19 +40,14 @@ HdCyclesPlugin::HdCyclesPlugin()
 
 HdCyclesPlugin::~HdCyclesPlugin() {}
 
-#if PXR_VERSION < 2302
-bool HdCyclesPlugin::IsSupported() const
-{
-  return true;
-}
-#else
-#  if PXR_VERSION >= 2511
+#if PXR_VERSION >= 2511
 bool HdCyclesPlugin::IsSupported(HdRendererCreateArgs const & /*rendererCreateArgs*/,
                                  std::string * /*reasonWhyNot*/) const
 {
   return true;
 }
-#  endif
+#endif
+#if PXR_VERSION < 2608
 bool HdCyclesPlugin::IsSupported(bool /*gpuEnabled*/) const
 {
   return true;
@@ -74,6 +76,32 @@ void HdCyclesPlugin::DeleteRenderDelegate(HdRenderDelegate *renderDelegate)
 TF_REGISTRY_FUNCTION(TfType)
 {
   HdRendererPluginRegistry::Define<PXR_NS::HdCyclesPlugin>();
+#if PXR_VERSION >= 2408
+  HdSceneIndexPluginRegistry::Define<PXR_NS::HdCycles_ImplicitSurfaceSceneIndexPlugin>();
+#endif
 }
+
+#if PXR_VERSION >= 2408
+HdSceneIndexBaseRefPtr HdCycles_ImplicitSurfaceSceneIndexPlugin::_AppendSceneIndex(
+    const HdSceneIndexBaseRefPtr &inputScene, const HdContainerDataSourceHandle & /*inputArgs*/)
+{
+  return HD_CYCLES_NS::HdCyclesImplicitMeshSceneIndex::New(inputScene);
+}
+
+// Cycles has no implicit surfaces, so turn USD Sphere, Cube, Cone, Cylinder, Capsule and Plane
+// into meshes before they reach the render delegate.
+TF_REGISTRY_FUNCTION(HdSceneIndexPlugin)
+{
+  HdSceneIndexPluginRegistry::GetInstance().RegisterSceneIndexForRenderer(
+      "Cycles",
+      TfToken("HdCycles_ImplicitSurfaceSceneIndexPlugin"),
+      nullptr,
+      0,
+      HdSceneIndexPluginRegistry::InsertionOrderAtStart);
+
+  /* The others, shared with programs that link the delegate (cycles_usd_render). */
+  HD_CYCLES_NS::HdCyclesRegisterSceneIndices();
+}
+#endif
 
 PXR_NAMESPACE_CLOSE_SCOPE

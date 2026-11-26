@@ -107,6 +107,9 @@ class RenderScheduler {
   void set_denoiser_params(const DenoiseParams &params);
   bool is_denoiser_gpu_used() const;
 
+  /* Check whether a real-time denoiser like DLSS is active. */
+  bool is_denoiser_interactive() const;
+
   void set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling);
   bool is_adaptive_sampling_used() const;
 
@@ -146,6 +149,10 @@ class RenderScheduler {
   void set_time_limit(const double time_limit);
   double get_time_limit() const;
 
+  /* Longest time between display updates, in seconds.
+   * Zero lets the interval grow with the render time. */
+  void set_max_display_update_interval(const double max_display_update_interval);
+
   /* Get sample up to which rendering has been done.
    * This is an absolute 0-based value.
    *
@@ -163,6 +170,10 @@ class RenderScheduler {
    * Note that this is based on the scheduling information. In practice this means that if someone
    * requested for work to render the scheduler considers the work done. */
   int get_num_rendered_samples() const;
+
+  /* Get total number of samples rendered since the last scheduling reset, including all rendered
+   * samples across frames with an active real-time denoiser. */
+  int get_total_rendered_samples() const;
 
   /* Reset scheduler, indicating that rendering will happen from scratch.
    * Resets current rendered state, as well as scheduling information. */
@@ -379,6 +390,8 @@ class RenderScheduler {
 
     /* Number of rendered samples on top of the start sample. */
     int num_rendered_samples = 0;
+    /* Total number of rendered samples since the last scheduling reset. */
+    int total_rendered_samples = 0;
 
     /* Point in time the latest PathTraceDisplay work has been scheduled. */
     double last_display_update_time = 0.0;
@@ -459,6 +472,9 @@ class RenderScheduler {
   /* Limit in seconds for how long path tracing is allowed to happen.
    * Zero means no limit is applied. */
   double time_limit_ = 0.0;
+
+  /* Longest time between display updates in seconds, zero for no limit. */
+  double max_display_update_interval_ = 0.0;
 
   /* Headless rendering without interface. */
   bool headless_;

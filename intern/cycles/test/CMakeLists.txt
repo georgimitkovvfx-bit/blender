@@ -35,21 +35,26 @@ set(SRC
   util_aligned_malloc_test.cpp
   util_boundbox_test.cpp
   util_cache_limiter_test.cpp
+  util_colorspace_test.cpp
   util_half_test.cpp
   util_ies_test.cpp
   util_math_test.cpp
   util_math_fast_test.cpp
   util_math_float3_test.cpp
   util_math_float4_test.cpp
+  util_math_float3x3_test.cpp
+  util_math_quaternion_test.cpp
   util_rgbe_test.cpp
   util_md5_test.cpp
   util_path_test.cpp
   util_simd_test.cpp
   util_string_test.cpp
+  util_task_limiter_test.cpp
   util_task_test.cpp
   util_time_test.cpp
   util_transform_test.cpp
   util_types_base_test.cpp
+  util_types_spherical_harmonics_test.cpp
 )
 
 # Disable AVX tests on macOS. Rosetta has problems running them, and other

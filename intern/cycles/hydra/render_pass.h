@@ -21,8 +21,6 @@ class HdCyclesRenderPass final : public PXR_NS::HdRenderPass {
   bool IsConverged() const override;
 
  private:
-  void ResetConverged();
-
   void _Execute(const PXR_NS::HdRenderPassStateSharedPtr &renderPassState,
                 const PXR_NS::TfTokenVector &renderTags) override;
 
@@ -30,6 +28,13 @@ class HdCyclesRenderPass final : public PXR_NS::HdRenderPass {
 
   HdCyclesSession *_renderParam;
   unsigned int _lastSettingsVersion = 0;
+  bool _errorReported = false;
+  // Render tags drawn by the last execute, and the version of the prims' render tags then
+  PXR_NS::TfTokenVector _lastRenderTags;
+  unsigned int _lastRenderTagVersion = ~0u;
+  // Selected to Active sources resolved last, and the scene state version then
+  std::string _lastBakeSources;
+  unsigned int _lastBakeSourcesVersion = ~0u;
 };
 
 HDCYCLES_NAMESPACE_CLOSE_SCOPE

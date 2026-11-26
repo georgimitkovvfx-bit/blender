@@ -27,6 +27,10 @@
 #  include "util/projection.h"
 #  include "util/task.h"
 
+#  include <filesystem>
+#  include <iomanip>
+#  include <sstream>
+
 #endif
 
 CCL_NAMESPACE_BEGIN
@@ -123,12 +127,101 @@ void OSLManager::device_update_pre(Device * /*device*/, Scene *scene)
   /* set texture system (only on CPU devices, since GPU devices cannot use OIIO) */
   if (scene->shader_manager->use_osl()) {
     /* add special builtin texture types */
-    foreach_render_services([](OSLRenderServices *services) {
-      services->textures.insert(OSLUStringHash("@ao"), OSLTextureHandle(OSLTextureHandleType::AO));
-      services->textures.insert(OSLUStringHash("@bevel"),
+    const ImageManager *image_manager = scene->image_manager.get();
+    foreach_render_services([image_manager](OSLRenderServices *services) {
+      services->textures.insert({OSLUStringHash("@ao"), image_manager},
+                                OSLTextureHandle(OSLTextureHandleType::AO));
+      services->textures.insert({OSLUStringHash("@bevel"), image_manager},
                                 OSLTextureHandle(OSLTextureHandleType::BEVEL));
     });
   }
+}
+
+/* Thread infos reused for optimizing multiple groups. Each thread info that
+ * JITs creates a memory manager that OSL keeps as long as the shading system
+ * exists. This only reduces the problem and does not solve it for repeated
+ * compilation, and OSL's own optimize_all_groups() has the same problem. */
+class OSLThreadInfoPool {
+ public:
+  ~OSLThreadInfoPool()
+  {
+    for (const auto &[ss, thread_info] : thread_infos_) {
+      ss->destroy_thread_info(thread_info);
+    }
+  }
+
+  OSL::PerThreadInfo *acquire(OSL::ShadingSystem *ss)
+  {
+    const thread_scoped_lock lock(mutex_);
+    for (auto it = thread_infos_.begin(); it != thread_infos_.end(); ++it) {
+      if (it->first == ss) {
+        OSL::PerThreadInfo *thread_info = it->second;
+        thread_infos_.erase(it);
+        return thread_info;
+      }
+    }
+    return ss->create_thread_info();
+  }
+
+  void release(OSL::ShadingSystem *ss, OSL::PerThreadInfo *thread_info)
+  {
+    const thread_scoped_lock lock(mutex_);
+    thread_infos_.emplace_back(ss, thread_info);
+  }
+
+ private:
+  thread_mutex mutex_;
+  vector<std::pair<OSL::ShadingSystem *, OSL::PerThreadInfo *>> thread_infos_;
+};
+
+static void optimize_group(OSLThreadInfoPool &thread_infos,
+                           OSL::ShadingSystem *ss,
+                           ImageManager *image_manager,
+                           OSL::ShaderGroup *group)
+{
+  /* Shading context for this group only, as it can't be shared between threads. It
+   * identifies the image manager in #OSLRenderServices::get_texture_handle(). */
+  OSLRenderServices *services = static_cast<OSLRenderServices *>(ss->renderer());
+  OSL::PerThreadInfo *thread_info = thread_infos.acquire(ss);
+  /* Dummy texture thread info like the render threads (OSLThreadData): there is no OSL texture
+   * system, which constant folding of gettextureinfo would ask for one. */
+  OSL::ShadingContext *context = ss->get_context(
+      thread_info, reinterpret_cast<OSL::TextureSystem::Perthread *>(1));
+  services->image_manager_add(context, image_manager);
+
+  ss->optimize_group(group, context, true);
+
+  services->image_manager_remove(context);
+  ss->release_context(context);
+  thread_infos.release(ss, thread_info);
+}
+
+static void optimize_group(TaskPool &pool,
+                           OSLThreadInfoPool &thread_infos,
+                           OSL::ShadingSystem *ss,
+                           ImageManager *image_manager,
+                           const OSL::ShaderGroupRef &group_ref)
+{
+  if (!group_ref) {
+    return;
+  }
+
+  /* Workaround #156348: depending on the system-wide `libgcc` version, EH frames
+   * registered and de-registered during OSL JIT might leave the process in a bad state.
+   * There is a bug report about it in the gcc:
+   * https://gcc.gnu.org/bugzilla/show_bug.cgi?id=119151
+   *
+   * Note that it is the runtime libgcc version that matters, as it is linked dynamically.
+   */
+  OSL::ShaderGroup *group = group_ref.get();
+#  if defined(_WIN32) || defined(__APPLE__)
+  pool.push([&thread_infos, ss, image_manager, group]() {
+    optimize_group(thread_infos, ss, image_manager, group);
+  });
+#  else
+  optimize_group(thread_infos, ss, image_manager, group);
+  (void)pool;
+#  endif
 }
 
 void OSLManager::device_update_post(Device *device,
@@ -227,27 +320,33 @@ void OSLManager::device_update_post(Device *device,
      */
     const thread_scoped_lock lock(ss_shared_mutex);
 
-    /* Set current image manager during the lock, so that there is no conflict with other shader
-     * manager instances.
+    /* Only optimize the groups of this scene, with its own image manager for texture handles.
+     * The shading system is shared with other sessions, which optimize their own groups.
      *
-     * It is used in "OSLRenderServices::get_texture_handle" called during optimization below to
-     * load images for the GPU. */
-    OSLRenderServices::image_manager = scene->image_manager.get();
+     * Isolate to avoid running tasks that wait for the lock held by this thread. */
+    ImageManager *image_manager = scene->image_manager.get();
+    isolate_task([&]() {
+      OSLThreadInfoPool thread_infos;
+      TaskPool pool;
 
-    foreach_shading_system([](OSL::ShadingSystem *ss) {
-    /* Workaround #156348: depending on the system-wide `libgcc` version, EH frames registered and
-     * de-registered during OSL JIT might leave the process in a bad state. There is a bug report
-     * about it in the gcc: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=119151
-     *
-     * Note that it is the runtime libgcc version that matters, as it is linked dynamically. */
-#  if defined(_WIN32) || defined(__APPLE__)
-      ss->optimize_all_groups();
-#  else
-      ss->optimize_all_groups(1);
-#  endif
+      foreach_osl_device(device, [&](Device *sub_device, OSLGlobals *og) {
+        const auto ss_it = ss_map.find(sub_device->info.type);
+        if (ss_it == ss_map.end()) {
+          return;
+        }
+        OSL::ShadingSystem *ss = ss_it->second.get();
+        for (const vector<OSL::ShaderGroupRef> *states :
+             {&og->surface_state, &og->volume_state, &og->displacement_state, &og->bump_state})
+        {
+          for (const OSL::ShaderGroupRef &group_ref : *states) {
+            optimize_group(pool, thread_infos, ss, image_manager, group_ref);
+          }
+        }
+        optimize_group(pool, thread_infos, ss, image_manager, og->camera_state);
+      });
+
+      pool.wait_work();
     });
-
-    OSLRenderServices::image_manager = nullptr;
   }
 
   /* Load OSL kernels on changes to shaders, or when main kernels got reloaded. */
@@ -282,9 +381,16 @@ void OSLManager::device_free(Device *device, DeviceScene * /*dscene*/, Scene *sc
 
   /* Remove any textures specific to an image manager from shared render services textures, since
    * the image manager may get destroyed next. */
+  free_textures(scene);
+}
+
+/* Shaders compiled next add their images again, also the files that texture() calls of script
+ * nodes read (looked up by file name), so files changed on disk are loaded again. */
+void OSLManager::free_textures(Scene *scene)
+{
   foreach_render_services([scene](OSLRenderServices *services) {
     for (auto it = services->textures.begin(); it != services->textures.end();) {
-      if (it->second.handle.get_manager() == scene->image_manager.get()) {
+      if (it->first.image_manager == scene->image_manager.get()) {
         /* Don't lock again, since the iterator already did so. */
         services->textures.erase(it->first, false);
         it.clear();
@@ -494,9 +600,19 @@ const char *OSLManager::shader_load_filepath(string filepath)
   uint64_t modified_time = path_modified_time(filepath);
 
   if (extension == ".osl") {
-    /* .OSL File */
-    const string osopath = filepath.substr(0, len - 4) + ".oso";
-    const uint64_t oso_modified_time = path_modified_time(osopath);
+    /* .OSL File, compiled next to it, or in the temporary directory when that is not writable
+     * (e.g. installed example scripts). */
+    string osopath = filepath.substr(0, len - 4) + ".oso";
+    uint64_t oso_modified_time = path_modified_time(osopath);
+    MD5Hash md5;
+    md5.append(filepath);
+    const string temp_osopath = path_join(
+        path_join(std::filesystem::temp_directory_path().string(), "cycles_osl"),
+        md5.get_hex() + ".oso");
+    if (oso_modified_time < modified_time && path_modified_time(temp_osopath) >= modified_time) {
+      osopath = temp_osopath;
+      oso_modified_time = path_modified_time(osopath);
+    }
 
     /* test if we have loaded the corresponding .OSO already */
     if (oso_modified_time != 0) {
@@ -509,7 +625,11 @@ const char *OSLManager::shader_load_filepath(string filepath)
 
     /* Auto-compile .OSL to .OSO if needed. */
     if (oso_modified_time == 0 || (oso_modified_time < modified_time)) {
-      OSLManager::osl_compile(filepath, osopath);
+      if (!OSLManager::osl_compile(filepath, osopath) && osopath != temp_osopath) {
+        osopath = temp_osopath;
+        path_create_directories(osopath);
+        OSLManager::osl_compile(filepath, osopath);
+      }
       modified_time = path_modified_time(osopath);
     }
     else {
@@ -553,6 +673,50 @@ const char *OSLManager::shader_load_filepath(string filepath)
   return shader_load_bytecode(bytecode_hash, bytecode);
 }
 
+/* Attributes that a shader reads with getattribute(), when the name is a string constant or a
+ * string parameter: (parameter name or empty, name or parameter default). The node reads the
+ * parameter's own value, since the user sets the name there.
+ * shortcut: a name computed at run time or from a connected string parameter is not found (then
+ * another node must request the attribute, like in Blender); upgrade by asking OSL for the
+ * "attributes_needed" of the optimized shader group, if that becomes available in time. */
+static vector<pair<ustring, ustring>> oso_getattribute_names(const string &bytecode)
+{
+  map<string, pair<ustring, ustring>> strings;
+  vector<pair<ustring, ustring>> names;
+  std::istringstream lines(bytecode);
+  string line;
+  while (std::getline(lines, line)) {
+    std::istringstream tokens(line);
+    string op;
+    tokens >> op;
+    if (op == "const" || op == "param") {
+      /* E.g. const string $const1 "name" %read{1,1} %write{2147483647,-1} */
+      string type, symbol, value;
+      tokens >> type >> symbol >> std::ws;
+      if (type == "string" && tokens.peek() == '"' && tokens >> std::quoted(value)) {
+        strings[symbol] = {op == "param" ? ustring(symbol) : ustring(), ustring(value)};
+      }
+    }
+    else if (op == "getattribute") {
+      /* getattribute result [object] name [index] value %line{1} ..., the name is the last
+       * string argument. */
+      string arg;
+      pair<ustring, ustring> name;
+      tokens >> arg;
+      while (tokens >> arg && arg[0] != '%') {
+        const auto it = strings.find(arg);
+        if (it != strings.end()) {
+          name = it->second;
+        }
+      }
+      if (!name.first.empty() || !name.second.empty()) {
+        names.push_back(name);
+      }
+    }
+  }
+  return names;
+}
+
 const char *OSLManager::shader_load_bytecode(const string &hash, const string &bytecode)
 {
   foreach_shading_system(
@@ -567,9 +731,13 @@ const char *OSLManager::shader_load_bytecode(const string &hash, const string &b
   }
 
   /* this is a bit weak, but works */
-  info.has_surface_emission = (bytecode.find("\"emission\"") != string::npos);
-  info.has_surface_transparent = (bytecode.find("\"transparent\"") != string::npos);
-  info.has_surface_bssrdf = (bytecode.find("\"bssrdf\"") != string::npos);
+  info.has_surface_emission = (bytecode.find("\"emission\"") != string::npos ||
+                               bytecode.find("\"uniform_edf\"") != string::npos);
+  info.has_surface_transparent = (bytecode.find("\"transparent\"") != string::npos ||
+                                  bytecode.find("\"transparent_bsdf\"") != string::npos);
+  info.has_surface_bssrdf = (bytecode.find("\"bssrdf\"") != string::npos ||
+                             bytecode.find("\"subsurface_bssrdf\"") != string::npos);
+  info.attributes = oso_getattribute_names(bytecode);
 
   loaded_shaders[hash] = info;
 
@@ -583,9 +751,7 @@ uint64_t OSLShaderManager::get_attribute_id(ustring name)
 
 uint64_t OSLShaderManager::get_attribute_id(AttributeStandard std)
 {
-  /* if standard attribute, use geom: name convention */
-  const ustring stdname(string("geom:") + string(Attribute::standard_name(std)));
-  return stdname.hash();
+  return Attribute::osl_name(std).hash();
 }
 
 void OSLShaderManager::device_update_specific(Device *device,
@@ -876,6 +1042,9 @@ OSLNode *OSLShaderManager::osl_node(ShaderGraph *graph,
   else {
     node->filepath = filepath;
   }
+  node->requested_attributes = info->attributes;
+  node->has_bssrdf = info->has_surface_bssrdf;
+  node->has_transparent = info->has_surface_transparent;
 
   /* Generate inputs and outputs */
   node->create_inputs_outputs(node->type);
@@ -1402,12 +1571,7 @@ void OSLCompiler::parameter_string_array(const char *name, const array<ustring> 
 
 void OSLCompiler::parameter_attribute(const char *name, ustring s)
 {
-  if (Attribute::name_standard(s.c_str())) {
-    parameter(name, (string("geom:") + s.c_str()).c_str());
-  }
-  else {
-    parameter(name, s.c_str());
-  }
+  parameter(name, Attribute::osl_name(s));
 }
 
 void OSLCompiler::find_dependencies(ShaderNodeSet &dependencies, ShaderInput *input)
@@ -1467,6 +1631,9 @@ void OSLCompiler::generate_nodes(const ShaderNodeSet &nodes)
             }
             if (node->has_bump()) {
               current_shader->has_bump_from_surface = true;
+            }
+            if (node->has_dispersion()) {
+              current_shader->has_dispersion = true;
             }
           }
           else if (current_type == SHADER_TYPE_VOLUME) {
@@ -1538,6 +1705,12 @@ void OSLCompiler::compile(Shader *shader)
 
     current_shader = shader;
 
+    /* The textures of the previous compile hold their images until the render services are
+     * freed otherwise, also images the shader no longer uses (a changed file path). */
+    for (const ustring &texture : shader->osl_cache[device].textures) {
+      services->textures.erase({OSLUStringHash(texture), scene->image_manager.get()});
+    }
+
     Shader::OSLCache cache;
 
     if (shader->reference_count()) {
@@ -1555,6 +1728,7 @@ void OSLCompiler::compile(Shader *shader)
       }
     }
 
+    cache.textures = std::move(textures_);
     shader->osl_cache[device] = std::move(cache);
 
     /* Estimate emission for MIS. */
@@ -1569,7 +1743,9 @@ void OSLCompiler::parameter_texture(const char *name, const ImageHandle &handle)
    * to get handle again. Note that this name must be unique between multiple
    * render sessions as the render services are shared. */
   const ustring filename(string_printf("@svm%d", texture_shared_unique_id++).c_str());
-  services->textures.insert(OSLUStringHash(filename), OSLTextureHandle(handle));
+  services->textures.insert({OSLUStringHash(filename), scene->image_manager.get()},
+                            OSLTextureHandle(handle));
+  textures_.push_back(filename);
   parameter(name, filename);
 }
 
@@ -1577,8 +1753,9 @@ void OSLCompiler::parameter_texture_ies(const char *name, const int svm_slot)
 {
   /* IES light textures stored in SVM. */
   const ustring filename(string_printf("@svm%d", texture_shared_unique_id++).c_str());
-  services->textures.insert(OSLUStringHash(filename),
+  services->textures.insert({OSLUStringHash(filename), scene->image_manager.get()},
                             OSLTextureHandle(OSLTextureHandleType::IES, svm_slot));
+  textures_.push_back(filename);
   parameter(name, filename);
 }
 
@@ -1598,6 +1775,7 @@ void OSLManager::device_update_post(Device * /*device*/,
 {
 }
 void OSLManager::device_free(Device * /*device*/, DeviceScene * /*dscene*/, Scene * /*scene*/) {}
+void OSLManager::free_textures(Scene * /*scene*/) {}
 
 void OSLManager::tag_update() {}
 bool OSLManager::need_update() const
@@ -1643,6 +1821,8 @@ void OSLCompiler::parameter_color_array(const char * /*name*/, const array<packe
 }
 
 void OSLCompiler::parameter_string_array(const char * /*name*/, const array<ustring> & /*a*/) {}
+
+void OSLCompiler::parameter_attribute(const char * /*name*/, ustring /*s*/) {}
 
 void OSLCompiler::parameter_texture(const char * /*name*/, const ImageHandle & /*handle*/) {}
 

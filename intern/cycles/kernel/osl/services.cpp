@@ -12,6 +12,7 @@
 #endif
 
 #include "util/log.h"
+#include "util/progress.h"
 #include "util/string.h"
 #include "util/types_image.h"
 
@@ -28,8 +29,6 @@
 CCL_NAMESPACE_BEGIN
 
 /* RenderServices implementation */
-
-ImageManager *OSLRenderServices::image_manager = nullptr;
 
 OSLRenderServices::OSLRenderServices(const int device_type)
     /* Dummy texture system pointer so OSL doesn't create its own. Such an opaque texture system
@@ -252,13 +251,40 @@ OSL::TextureSystem::TextureHandle *OSLRenderServices::get_texture_handle(
   return get_texture_handle(to_ustring(filename), context, opt);
 }
 
-OSL::TextureSystem::TextureHandle *OSLRenderServices::get_texture_handle(
-    OSL::ustring filename, OSL::ShadingContext * /*context*/, const OSL::TextureOpt * /*options*/)
+void OSLRenderServices::image_manager_add(const OSL::ShadingContext *context,
+                                          ImageManager *image_manager)
 {
+  const thread_scoped_lock lock(image_managers_mutex_);
+  image_managers_[context] = image_manager;
+}
+
+void OSLRenderServices::image_manager_remove(const OSL::ShadingContext *context)
+{
+  const thread_scoped_lock lock(image_managers_mutex_);
+  image_managers_.erase(context);
+}
+
+ImageManager *OSLRenderServices::image_manager_find(const OSL::ShadingContext *context)
+{
+  const thread_scoped_lock lock(image_managers_mutex_);
+  auto it = image_managers_.find(context);
+  return (it != image_managers_.end()) ? it->second : nullptr;
+}
+
+OSL::TextureSystem::TextureHandle *OSLRenderServices::get_texture_handle(
+    OSL::ustring filename, OSL::ShadingContext *context, const OSL::TextureOpt * /*options*/)
+{
+  ImageManager *image_manager = image_manager_find(context);
+  if (image_manager == nullptr) {
+    LOG_WARNING << "Open Shading Language texture call can not resolve " << filename.c_str()
+                << ", filename must be a compile-time constant";
+    return nullptr;
+  }
+
   /* Note the mutex lock in find_or_insert() is not so bad for performance because
    * this function only gets called once per texture handle to create it, not for
    * every texture access. */
-  auto [it, inserted] = textures.find_or_insert(filename,
+  auto [it, inserted] = textures.find_or_insert({filename, image_manager},
                                                 OSLTextureHandle(OSLTextureHandleType::IMAGE));
 
   if (inserted) {
@@ -319,7 +345,7 @@ bool OSLRenderServices::texture(OSLUStringHash filename,
   return osl_shared_texture(globals->kg,
                             globals,
                             texture_handle,
-                            static_cast<void *>(&options),
+                            reinterpret_cast<OSLTextureOptions *>(&options),
                             s,
                             t,
                             dsdx,
@@ -370,7 +396,7 @@ bool OSLRenderServices::texture3d(OSLUStringHash filename,
 bool OSLRenderServices::environment(OSLUStringHash filename,
                                     TextureHandle *texture_handle,
                                     TexturePerthread * /*thread_info*/,
-                                    OSL::TextureOpt & /*options*/,
+                                    OSL::TextureOpt &options,
                                     OSL::ShaderGlobals *sg,
                                     const OSL::Vec3 &R,
                                     const OSL::Vec3 &dRdx,
@@ -391,12 +417,19 @@ bool OSLRenderServices::environment(OSLUStringHash filename,
 
   ShaderGlobals *globals = reinterpret_cast<ShaderGlobals *>(sg);
 
+  /* OSL passes no derivatives (null references) for a direction without them, e.g. a constant. */
+  const auto derivative = [](const OSL::Vec3 &d) {
+    const OSL::Vec3 *ptr = &d;
+    return ptr ? make_float3(ptr->x, ptr->y, ptr->z) : zero_float3();
+  };
+
   return osl_shared_environment(globals->kg,
                                 globals,
                                 texture_handle,
+                                reinterpret_cast<OSLTextureOptions *>(&options),
                                 make_float3(R.x, R.y, R.z),
-                                make_float3(dRdx.x, dRdx.y, dRdx.z),
-                                make_float3(dRdy.x, dRdy.y, dRdy.z),
+                                derivative(dRdx),
+                                derivative(dRdy),
                                 nchannels,
                                 result);
 }
@@ -411,6 +444,46 @@ bool OSLRenderServices::get_texture_info(OSLUStringHash filename,
                                          void *data,
                                          OSLUStringHash * /*errormessage*/)
 {
+  /* Constant folding during shader optimization has no texture handle and folds a failure to 0,
+   * before images are loaded: answer from the file metadata. */
+  ImageManager *image_manager = (texture_handle == nullptr && sg) ?
+                                    image_manager_find(sg->context) :
+                                    nullptr;
+  if (image_manager) {
+    texture_handle = get_texture_handle(filename, sg->context, nullptr);
+    OSLTextureHandle handle(OSLTextureHandleType::IMAGE);
+    if (!textures.retrieve({filename, image_manager}, handle) || is_udim(texture_handle)) {
+      return false;
+    }
+    Progress progress;
+    const ImageMetaData metadata = handle.handle.metadata(progress);
+    const bool exists = metadata.width > 0 && metadata.height > 0;
+    if (dataname == DeviceStrings::u_exists && datatype == TypeInt) {
+      *static_cast<int *>(data) = exists;
+      return true;
+    }
+    if (!exists) {
+      return false;
+    }
+    if (dataname == DeviceStrings::u_channels && datatype == TypeInt) {
+      *static_cast<int *>(data) = metadata.channels;
+      return true;
+    }
+    if (dataname == DeviceStrings::u_resolution && datatype.basetype == TypeDesc::INT &&
+        (datatype.arraylen == 2 || datatype.arraylen == 3 || datatype.aggregate == 2 ||
+         datatype.aggregate == 3))
+    {
+      int *res = static_cast<int *>(data);
+      res[0] = int(metadata.width);
+      res[1] = int(metadata.height);
+      if (datatype.arraylen == 3 || datatype.aggregate == 3) {
+        res[2] = 1;
+      }
+      return true;
+    }
+    return false;
+  }
+
   if (texture_handle == nullptr) {
     if (texture_filenames_seen_.insert(filename).second) {
       LOG_WARNING << "Open Shading Language gettextureinfo call can not resolve "
@@ -570,8 +643,10 @@ bool OSLRenderServices::trace(TraceOpt &options,
   }
   else {
     /* Ray-trace, leaving out shadow opaque to avoid early exit. */
-    const PathRayVisibility visibility = PATH_RAY_VISIBILITY_ALL &
-                                         ~PATH_RAY_VISIBILITY_SHADOW_OPAQUE;
+    PathRayVisibility visibility = PATH_RAY_VISIBILITY_ALL & ~PATH_RAY_VISIBILITY_SHADOW_OPAQUE;
+    if (options.traceset == DeviceStrings::u_traceset_raycast) {
+      visibility = PATH_RAY_VISIBILITY_RAYCAST;
+    }
     tracedata->hit = scene_intersect(kg, &ray, visibility, &tracedata->isect);
     if (tracedata->hit) {
       tracedata->self_hit = tracedata->isect.object == sd->object;

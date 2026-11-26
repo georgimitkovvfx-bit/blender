@@ -185,6 +185,10 @@ class ShaderNode : public Node {
   {
     return false;
   }
+  virtual bool has_dispersion()
+  {
+    return false;
+  }
   virtual bool has_bump()
   {
     return false;
@@ -248,7 +252,7 @@ class ShaderNode : public Node {
    * so it's possible to disable huge nodes inside of the required
    * nodes group.
    */
-  virtual uint get_feature()
+  virtual uint64_t get_feature()
   {
     return bump == SHADER_BUMP_NONE ? 0 : KERNEL_FEATURE_NODE_BUMP;
   }
@@ -359,7 +363,7 @@ class ShaderGraph : public NodeOwner {
 
   int get_num_closures();
 
-  void dump_graph(const char *filename);
+  void dump_graph(const char *filename, const bool verbose = false);
 
   /* Create node from class and add it to the shader graph. */
   template<typename T, typename... Args> T *create_node(Args &&...args)

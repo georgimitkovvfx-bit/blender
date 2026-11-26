@@ -132,7 +132,26 @@ ccl_device bool integrator_init_from_bake(KernelGlobals kg,
     return true;
   }
 
-  prim += kernel_data.bake.tri_offset;
+  /* The object of the pixel when the bake object pass has one (bakes from other objects than the
+   * target, like Selected to Active), else the bake target. */
+  int object = kernel_data.bake.object_index;
+  if (kernel_data.film.pass_bake_object != PASS_UNUSED) {
+    /* The pass may be written for another scene than the one rendered (an application snapshot
+     * taken before the scene changed): skip objects and triangles that do not exist. */
+    object = __float_as_uint(buffer[kernel_data.film.pass_bake_object]);
+    if (uint(object) >= uint(kernel_data.bake.num_objects)) {
+      film_write_transparent(kg, 0, 1.0f, buffer);
+      return true;
+    }
+    prim += kernel_data_fetch(object_prim_offset, object);
+    if (uint(prim) >= uint(kernel_data.bake.num_triangles)) {
+      film_write_transparent(kg, 0, 1.0f, buffer);
+      return true;
+    }
+  }
+  else {
+    prim += kernel_data.bake.tri_offset;
+  }
 
   /* Random number generator. */
   uint rng_pixel = 0;
@@ -161,7 +180,7 @@ ccl_device bool integrator_init_from_bake(KernelGlobals kg,
 
   /* Exactly at vertex? Nudge inwards to avoid self-intersection. */
   if ((u == 0.0f || u == 1.0f) && (v == 0.0f || v == 1.0f)) {
-    const float2 uv = bake_offset_towards_center(kg, kernel_data.bake.object_index, prim, u, v);
+    const float2 uv = bake_offset_towards_center(kg, object, prim, u, v);
     u = uv.x;
     v = uv.y;
   }
@@ -182,7 +201,6 @@ ccl_device bool integrator_init_from_bake(KernelGlobals kg,
   dvdy = -tmpdy - dvdy;
 
   /* Position and normal on triangle. */
-  const int object = kernel_data.bake.object_index;
   float3 P;
   float3 Ng;
   int shader;
@@ -226,12 +244,17 @@ ccl_device bool integrator_init_from_bake(KernelGlobals kg,
     const int shader_index = shader & SHADER_MASK;
     const int shader_flags = kernel_data_fetch(shaders, shader_index).flags;
 
-    /* Fast path for position and normal passes not affected by shaders. */
-    if (kernel_data.film.pass_position != PASS_UNUSED) {
+    /* Fast path for position and normal passes not affected by shaders, when no other pass
+     * needs the shading (the Hydra delegate bakes several passes at once). */
+    const bool only_data_passes = kernel_data.film.pass_combined == PASS_UNUSED &&
+                                  kernel_data.film.light_pass_flag == 0;
+    if (kernel_data.film.pass_position != PASS_UNUSED && only_data_passes) {
       film_write_pass_float3(buffer + kernel_data.film.pass_position, P);
       return true;
     }
-    if (kernel_data.film.pass_normal != PASS_UNUSED && !(shader_flags & SD_HAS_BUMP)) {
+    if (kernel_data.film.pass_normal != PASS_UNUSED && !(shader_flags & SD_HAS_BUMP) &&
+        only_data_passes)
+    {
       film_write_pass_float3(buffer + kernel_data.film.pass_normal, N);
       return true;
     }
@@ -308,7 +331,7 @@ ccl_device bool integrator_init_from_bake(KernelGlobals kg,
 
     /* Setup and write intersection. */
     Intersection isect ccl_optional_struct_init;
-    isect.object = kernel_data.bake.object_index;
+    isect.object = object;
     isect.prim = prim;
     isect.u = u;
     isect.v = v;

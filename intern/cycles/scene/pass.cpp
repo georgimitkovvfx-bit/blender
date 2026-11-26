@@ -93,6 +93,7 @@ const NodeEnum *Pass::get_type_enum()
     pass_type_enum.insert("denoising_roughness", PASS_DENOISING_ROUGHNESS);
     pass_type_enum.insert("denoising_depth", PASS_DENOISING_DEPTH);
     pass_type_enum.insert("denoising_backward_motion", PASS_DENOISING_BACKWARD_MOTION);
+    pass_type_enum.insert("denoising_specular_motion", PASS_DENOISING_SPECULAR_MOTION);
     pass_type_enum.insert("denoising_previous", PASS_DENOISING_PREVIOUS);
     pass_type_enum.insert("volume_majorant", PASS_VOLUME_MAJORANT);
     pass_type_enum.insert("volume_majorant_sample_count", PASS_VOLUME_MAJORANT_SAMPLE_COUNT);
@@ -105,6 +106,7 @@ const NodeEnum *Pass::get_type_enum()
     pass_type_enum.insert("bake_primitive", PASS_BAKE_PRIMITIVE);
     pass_type_enum.insert("bake_seed", PASS_BAKE_SEED);
     pass_type_enum.insert("bake_differential", PASS_BAKE_DIFFERENTIAL);
+    pass_type_enum.insert("bake_object", PASS_BAKE_OBJECT);
 
 #ifdef WITH_CYCLES_DEBUG
     pass_type_enum.insert("guiding_color", PASS_GUIDING_COLOR);
@@ -313,6 +315,7 @@ PassInfo Pass::get_info(const PassType type,
     case PASS_DENOISING_SPECULAR_ALBEDO:
     case PASS_DENOISING_NORMAL:
     case PASS_DENOISING_BACKWARD_MOTION:
+    case PASS_DENOISING_SPECULAR_MOTION:
       pass_info.num_components = 3;
       break;
     case PASS_DENOISING_ROUGHNESS:
@@ -376,6 +379,11 @@ PassInfo Pass::get_info(const PassType type,
       break;
     case PASS_BAKE_DIFFERENTIAL:
       pass_info.num_components = 4;
+      pass_info.use_exposure = false;
+      pass_info.use_filter = false;
+      break;
+    case PASS_BAKE_OBJECT:
+      pass_info.num_components = 1;
       pass_info.use_exposure = false;
       pass_info.use_filter = false;
       break;

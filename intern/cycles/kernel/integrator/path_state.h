@@ -8,6 +8,8 @@
 
 #include "kernel/sample/pattern.h"
 
+#include "kernel/util/colorspace.h"
+
 CCL_NAMESPACE_BEGIN
 
 /* Initialize queues, so that this path is considered terminated.
@@ -93,6 +95,10 @@ ccl_device_inline void path_state_init_integrator(KernelGlobals kg,
     INTEGRATOR_STATE_ARRAY_WRITE(state, volume_stack, 1, shader) = SHADER_NONE;
   }
 
+  if (kernel_data.kernel_features & KERNEL_FEATURE_DIELECTRIC_PRIORITY) {
+    INTEGRATOR_STATE_ARRAY_WRITE(state, dielectric_stack, 0, shader) = SHADER_NONE;
+  }
+
 #ifdef __DENOISING_FEATURES__
   if (kernel_data.kernel_features & KERNEL_FEATURE_DENOISING) {
     INTEGRATOR_STATE_WRITE(state, path, flag) |= PATH_RAY_DENOISING_FEATURES;
@@ -110,7 +116,7 @@ ccl_device_inline void path_state_init_integrator(KernelGlobals kg,
 ccl_device_inline void path_state_next(KernelGlobals kg,
                                        IntegratorState state,
                                        const int label,
-                                       const int shader_flag)
+                                       const int runtime_flag)
 {
   PathRayVisibility visibility = INTEGRATOR_STATE(state, path, visibility);
   uint32_t flag = INTEGRATOR_STATE(state, path, flag);
@@ -127,7 +133,7 @@ ccl_device_inline void path_state_next(KernelGlobals kg,
       flag |= PATH_RAY_TERMINATE_ON_NEXT_SURFACE;
     }
 
-    if (shader_flag & SD_RAY_PORTAL) {
+    if (runtime_flag & SR_RAY_PORTAL) {
       flag |= PATH_RAY_MIS_SKIP;
       INTEGRATOR_STATE_WRITE(
           state, path, portal_bounce) = INTEGRATOR_STATE(state, path, portal_bounce) + 1;
@@ -223,7 +229,7 @@ ccl_device_inline void path_state_next(KernelGlobals kg,
     }
 
     /* Flag for consistent MIS weights with light tree. */
-    if (shader_flag & SD_BSDF_HAS_TRANSMISSION) {
+    if (runtime_flag & SR_BSDF_HAS_TRANSMISSION) {
       flag |= PATH_RAY_MIS_HAD_TRANSMISSION;
     }
 
@@ -427,5 +433,29 @@ ccl_device_inline float path_state_rng_light_termination(KernelGlobals kg,
   }
   return 0.0f;
 }
+
+#ifdef __SPECTRAL__
+ccl_device_inline Spectrum dispersion_throughput_weight(KernelGlobals kg, const float rand)
+{
+  float prob;
+  const float wavelength = sample_wavelength(rand, &prob);
+  return wavelength_to_rgb_d65(kg, wavelength) / prob;
+}
+
+ccl_device_inline void update_path_throughput_for_dispersion(KernelGlobals kg,
+                                                             IntegratorState state,
+                                                             const float rand)
+{
+  const uint32_t path_flag = INTEGRATOR_STATE(state, path, flag);
+  if (path_flag & PATH_RAY_SPECTRAL) {
+    /* Throughput is already updated. */
+    return;
+  }
+
+  /* Update throughput since the path is now monochromatic. */
+  INTEGRATOR_STATE_WRITE(state, path, throughput) *= dispersion_throughput_weight(kg, rand);
+  INTEGRATOR_STATE_WRITE(state, path, flag) |= PATH_RAY_SPECTRAL;
+}
+#endif
 
 CCL_NAMESPACE_END

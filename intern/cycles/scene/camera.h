@@ -33,7 +33,7 @@ class OSLCameraParamQuery {
 /* Camera
  *
  * The camera parameters are quite standard, tested to be both compatible with
- * Renderman, and Blender after remapping.
+ * RenderMan, and Blender after remapping.
  */
 
 class Camera : public Node {
@@ -60,6 +60,10 @@ class Camera : public Node {
   /* motion blur */
   NODE_SOCKET_API(float, shuttertime)
   NODE_SOCKET_API(MotionPosition, motion_position)
+  /* Where the frame time of the geometry lies in the shutter, as a fraction of the shutter: 0 at
+   * the start, 0.5 at the center, outside 0..1 for shutters not over the frame. FLT_MAX (default)
+   * uses the motion position. Volume velocity blur moves the density from that time. */
+  NODE_SOCKET_API(float, motion_time_offset)
   NODE_SOCKET_API_ARRAY(array<float>, shutter_curve)
   size_t shutter_table_offset;
 
@@ -140,6 +144,8 @@ class Camera : public Node {
   NODE_SOCKET_API_STRUCT_MEMBER(float, border, right)
   NODE_SOCKET_API_STRUCT_MEMBER(float, border, bottom)
   NODE_SOCKET_API_STRUCT_MEMBER(float, border, top)
+  NODE_SOCKET_API(float, border_pre_left)
+  NODE_SOCKET_API(float, border_pre_bottom)
 
   BoundBox2D viewport_camera_border;
   NODE_SOCKET_API_STRUCT_MEMBER(float, viewport_camera_border, left)
@@ -155,6 +161,17 @@ class Camera : public Node {
   NODE_SOCKET_API(bool, use_perspective_motion)
   NODE_SOCKET_API(float, fov_pre)
   NODE_SOCKET_API(float, fov_post)
+
+  BoundBox2D viewplane_pre;
+  BoundBox2D viewplane_post;
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_pre, left)
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_pre, right)
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_pre, bottom)
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_pre, top)
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_post, left)
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_post, right)
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_post, bottom)
+  NODE_SOCKET_API_STRUCT_MEMBER(float, viewplane_post, top)
 
   /* computed camera parameters */
   ProjectionTransform screentoworld;
@@ -225,7 +242,7 @@ class Camera : public Node {
   int motion_step(const float time) const;
   bool use_motion() const;
 
-  uint get_kernel_features() const;
+  uint64_t get_kernel_features() const;
 
   bool set_screen_size(int width, int height);
 

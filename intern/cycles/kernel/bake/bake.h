@@ -17,6 +17,8 @@
 
 #include "kernel/util/colorspace.h"
 
+#include "util/types_rgbe.h"
+
 CCL_NAMESPACE_BEGIN
 
 ccl_device void kernel_displace_evaluate(KernelGlobals kg,
@@ -36,7 +38,7 @@ ccl_device void kernel_displace_evaluate(KernelGlobals kg,
   const float3 P = sd.P;
   displacement_shader_eval(kg, state, &sd);
   float3 D = sd.P - P;
-  if (sd.flag & SD_CACHE_MISS) {
+  if (sd.runtime_flag & SR_CACHE_MISS) {
     *cache_miss = true;
   }
   object_inverse_dir_transform(kg, &sd, &D);
@@ -88,7 +90,7 @@ ccl_device void kernel_background_evaluate(KernelGlobals kg,
   surface_shader_eval<KERNEL_FEATURE_NODE_MASK_SURFACE_LIGHT &
                       ~(KERNEL_FEATURE_NODE_RAYTRACE | KERNEL_FEATURE_NODE_LIGHT_PATH)>(
       kg, state, &sd, nullptr, PATH_RAY_VISIBILITY_NONE, path_flag);
-  if (sd.flag & SD_CACHE_MISS) {
+  if (sd.runtime_flag & SR_CACHE_MISS) {
     *cache_miss = true;
   }
 
@@ -131,12 +133,12 @@ ccl_device void kernel_curve_shadow_transparency_evaluate(
                       ~(KERNEL_FEATURE_NODE_RAYTRACE | KERNEL_FEATURE_NODE_LIGHT_PATH)>(
       kg, state, &sd, nullptr, PATH_RAY_VISIBILITY_SHADOW, PATH_RAY_FLAG_NONE);
 
-  if (sd.flag & SD_CACHE_MISS) {
+  if (sd.runtime_flag & SR_CACHE_MISS) {
     *cache_miss = true;
   }
 
   /* Write output. */
-  output[offset] = clamp(average(surface_shader_transparency(&sd)), 0.0f, 1.0f);
+  output[offset] = rgb_to_rgbe(saturate(spectrum_to_rgb(surface_shader_transparency(&sd)))).f;
 #endif
 }
 
@@ -158,14 +160,15 @@ ccl_device void kernel_volume_density_evaluate(KernelGlobals kg,
   ray.P = make_float3(__int_as_float(in.prim), in.u, in.v);
   ray.D = zero_float3();
   ray.tmin = 0.0f;
-  /* Motion blur is ignored when computing the extrema of the density, but we also don't expect the
-   * value to change a lot in one frame. */
+  /* Object motion is ignored when computing the extrema of the density, but we also don't expect
+   * the value to change a lot in one frame. Velocity is not, see below. */
   ray.time = 0.5f;
 
   /* Setup shader data. */
   ShaderData sd;
   shader_setup_from_volume(&sd, &ray, in.object);
-  sd.flag = SD_IS_VOLUME_SHADER_EVAL;
+  sd.runtime_flag = SR_IS_VOLUME_SHADER_EVAL;
+  sd.shader_flag = 0;
   /* For stochastic texture sampling. */
   sd.lcg_state = lcg_state_init(offset, 0, 0, 0x15b4f88d);
 
@@ -194,6 +197,10 @@ ccl_device void kernel_volume_density_evaluate(KernelGlobals kg,
   const Transform tfm = need_transformation ?
                             object_fetch_transform(kg, sd.object, OBJECT_TRANSFORM) :
                             Transform();
+  /* Velocity moves the density in object space over the shutter (volume_shader_motion_blur), also
+   * where there is none at the center time: take the extrema over the shutter. */
+  const bool volume_motion = kernel_data_fetch(object_flag, sd.object) &
+                             SD_OBJECT_HAS_VOLUME_MOTION;
   for (int sample = 0; sample < num_samples; sample++) {
     /* Blue noise indexing. The sequence length is the number of samples. */
     const uint3 index = make_uint3(sample + offset * num_samples, 0, 0xffffffff);
@@ -202,9 +209,15 @@ ccl_device void kernel_volume_density_evaluate(KernelGlobals kg,
     const float3 rand_p = sobol_burley_sample_3D(
         index.x, PRNG_BAKE_VOLUME_DENSITY_EVAL, index.y, index.z);
     sd.P = ray.P + rand_p * voxel_size;
+    if (volume_motion) {
+      sd.time = (float(sample) + 0.5f) / float(num_samples);
+    }
     if (need_transformation) {
-      /* Convert to world space. */
-      sd.P = transform_point(&tfm, sd.P);
+      /* Convert to world space, at the time the shader converts back to object space at. */
+      const Transform object_tfm = volume_motion ? object_fetch_transform_motion_test(
+                                                       kg, sd.object, sd.time, nullptr) :
+                                                   tfm;
+      sd.P = transform_point(&object_tfm, sd.P);
     }
     sd.closure_transparent_extinction = zero_float3();
     sd.closure_emission_background = zero_float3();
@@ -215,7 +228,7 @@ ccl_device void kernel_volume_density_evaluate(KernelGlobals kg,
                              KERNEL_FEATURE_NODE_MASK_VOLUME & ~KERNEL_FEATURE_NODE_LIGHT_PATH>(
         kg, state, &sd, entry, path_visibility, path_flag);
 
-    if (sd.flag & SD_CACHE_MISS) {
+    if (sd.runtime_flag & SR_CACHE_MISS) {
       /* Note we keep rendering other samples so we find all cache misses in one go. */
       *cache_miss = true;
     }

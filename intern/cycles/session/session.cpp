@@ -128,6 +128,9 @@ void Session::start()
 
 void Session::cancel(bool quick)
 {
+  /* A held session thread must wake up to see the cancel. */
+  release_render_hold();
+
   /* Cancel any long running device operations (e.g. shader compilations). */
   device->cancel();
 
@@ -155,6 +158,25 @@ void Session::cancel(bool quick)
   }
 }
 
+void Session::hold_render()
+{
+  if (path_trace_) {
+    path_trace_->hold();
+  }
+}
+
+void Session::release_render_hold()
+{
+  if (path_trace_) {
+    path_trace_->release_hold();
+  }
+}
+
+bool Session::render_held()
+{
+  return path_trace_ && path_trace_->is_held();
+}
+
 bool Session::ready_to_reset()
 {
   return path_trace_->ready_to_reset();
@@ -165,6 +187,9 @@ void Session::run_main_render_loop()
   path_trace_->zero_display();
 
   while (true) {
+    /* The device scene is updated only once the host has finished changing the scene. */
+    path_trace_->wait_while_held();
+
     RenderWork render_work = run_update_for_next_iteration();
 
     const bool did_cancel = progress.get_cancel();
@@ -315,10 +340,23 @@ RenderWork Session::run_update_for_next_iteration()
   thread_scoped_lock scene_lock(scene->mutex);
 
   /* Perform delayed reset if requested. */
-  const bool reset_buffers = delayed_reset_buffer_params();
+  bool reset_buffers = delayed_reset_buffer_params();
 
   /* Update scene */
   const bool reset_scene = update_scene(delayed_reset_.do_reset);
+
+  /* The kernels address the render buffers with the passes of the scene. These can change
+   * without a reset of the buffers: the host changed a setting that adds passes (like denoising)
+   * and resets later, or reset while the scene mutex was unlocked to load kernels, after the
+   * check above. Never render into buffers allocated for other passes. */
+  if (!reset_buffers && buffer_params_.pass_stride != -1) {
+    BufferParams scene_buffer_params = buffer_params_;
+    scene_buffer_params.update_passes(scene->passes);
+    if (scene_buffer_params.passes != buffer_params_.passes) {
+      tile_manager_.reset_scheduling(buffer_params_, get_effective_tile_size());
+      reset_buffers = true;
+    }
+  }
 
   /* Update buffers for new parameters. After scene update which influences the passes used. */
   bool have_tiles = true;
@@ -358,6 +396,7 @@ RenderWork Session::run_update_for_next_iteration()
                                       params.sample_subset_offset,
                                       params.sample_subset_length);
   render_scheduler_.set_time_limit(params.time_limit);
+  render_scheduler_.set_max_display_update_interval(params.max_display_update_interval);
 
   while (have_tiles) {
     render_work = render_scheduler_.get_render_work();

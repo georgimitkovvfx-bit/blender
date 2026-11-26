@@ -973,7 +973,7 @@ static std::pair<int, LightTreeMeasure> light_tree_specialize_nodes_flatten(
     for (int i = 0; i < node->get_leaf().num_emitters; i++) {
       const LightTreeEmitter &emitter = flatten.emitters[node->get_leaf().first_emitter_index + i];
       if (emitter.light_set_membership & light_link_mask) {
-        /* Assumes emitters are consecutive due to LighTree::sort_leaf. */
+        /* Assumes emitters are consecutive due to LightTree::sort_leaf. */
         if (first_emitter == -1) {
           first_emitter = node->get_leaf().first_emitter_index + i;
         }
@@ -1081,6 +1081,8 @@ void LightManager::device_update_tree(Device * /*unused*/,
   /* We want to create separate arrays corresponding to triangles and lights,
    * which will be used to index back into the light tree for PDF calculations. */
   flatten.light_array = dscene->light_to_tree.alloc(scene->objects.size());
+  /* Lights not in the tree have no entry: keep their lookups deterministic. */
+  std::fill_n(flatten.light_array, scene->objects.size(), 0u);
   flatten.triangle_array = dscene->triangle_to_tree.alloc(light_tree.num_triangles);
 
   /* Allocate emitters */
@@ -1230,7 +1232,9 @@ void LightManager::device_update_background(Device *device,
     kbackground->map_res_x = 0;
     kbackground->map_res_y = 0;
     kbackground->map_dD = FLT_MAX;
-    kbackground->use_mis = (kbackground->portal_weight > 0.0f);
+    /* Portals only guide the sampling of a background light: without one, MIS would look up
+     * the light tree with an invalid background object index. */
+    kbackground->use_mis = false;
     return;
   }
 
@@ -1442,6 +1446,11 @@ void LightManager::device_update_lights(DeviceScene *dscene, Scene *scene)
     else if (light->is_enabled) {
       light->copy_to_kernel(klights + light_index, scene, object);
       light_index++;
+      /* The object manager picks the last background light, which may be disabled and so have
+       * no light tree entry for the forward MIS lookup: use the enabled one. */
+      if (light->is_background_light()) {
+        dscene->data.background.object_index = object->index;
+      }
     }
   }
 

@@ -323,7 +323,7 @@ NODE_DEFINE(Mesh)
   return type;
 }
 
-bool Mesh::need_tesselation()
+bool Mesh::need_tessellation()
 {
   return (subdivision_type != SUBDIVISION_NONE) &&
          (position_is_modified() || subd_dicing_rate_is_modified() ||
@@ -374,6 +374,14 @@ void Mesh::resize_subd_faces(const int numfaces, const int numcorners)
   num_subd_faces = numfaces;
 
   subd_attributes.resize();
+}
+
+/* Keep only the base vertices of a subdivision mesh, to update them without clearing the mesh.
+ * The count of added vertices goes with the vertices, the base vertex count is wrong otherwise. */
+void Mesh::clear_tessellation()
+{
+  resize_mesh(get_num_subd_base_verts(), 0);
+  num_subd_added_verts = 0;
 }
 
 void Mesh::reserve_subd_creases(const size_t num_creases)
@@ -834,7 +842,7 @@ void Mesh::update_tangents(Scene *scene, bool undisplaced)
   const char *tangent_postfix = (undisplaced) ? ".undisplaced_tangent" : ".tangent";
   const char *tangent_sign_postfix = (undisplaced) ? ".undisplaced_tangent_sign" : ".tangent_sign";
 
-  /* standard UVs */
+  /* Standard UVs. */
   if ((need_attribute(scene, tangent_std) || need_attribute(scene, tangent_sign_std)) &&
       !attributes.find(tangent_std))
   {

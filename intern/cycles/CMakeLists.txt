@@ -278,9 +278,12 @@ endif()
 
 if(WITH_CYCLES_DEVICE_ONEAPI)
   add_definitions(-DWITH_ONEAPI)
+  if(WITH_CYCLES_ONEAPI_SOFTWARE_TEXTURING)
+    add_definitions(-DWITH_CYCLES_ONEAPI_SOFTWARE_TEXTURING)
+  endif()
 endif()
 
-if(WITH_CYCLES_EMBREE)
+if(WITH_EMBREE)
   add_definitions(-DWITH_EMBREE)
   if(WITH_CYCLES_DEVICE_ONEAPI AND EMBREE_SYCL_SUPPORT)
     # NOTE: The debug version of Embree is built without SYCL support on Windows
@@ -309,6 +312,15 @@ endif()
 
 if(WITH_OPENIMAGEDENOISE)
   add_definitions(-DWITH_OPENIMAGEDENOISE)
+endif()
+
+if(WITH_DLSS)
+  find_package(DLSS)
+  if(DLSS_FOUND)
+    add_definitions(-DWITH_DLSS)
+  else()
+    set_and_warn_library_found("DLSS" DLSS_FOUND WITH_DLSS)
+  endif()
 endif()
 
 if(WITH_OPENVDB)
@@ -343,7 +355,7 @@ if(WITH_CYCLES_DEBUG_NAN)
   add_definitions(-DWITH_CYCLES_DEBUG_NAN)
 endif()
 
-if(WITH_PUGIXML OR OPENIMAGEIO_PUGIXML_FOUND)
+if(WITH_CYCLES_PUGIXML OR WITH_PUGIXML OR OPENIMAGEIO_PUGIXML_FOUND)
   add_definitions(-DWITH_PUGIXML)
   if((NOT OPENIMAGEIO_PUGIXML_FOUND) OR WIN32)
     add_definitions(-DWITH_SYSTEM_PUGIXML)

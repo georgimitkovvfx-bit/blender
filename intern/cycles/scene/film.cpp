@@ -199,6 +199,7 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
   kfilm->pass_volume_transmit_denoised = PASS_UNUSED;
   kfilm->pass_volume_majorant = PASS_UNUSED;
   kfilm->pass_lightgroup = PASS_UNUSED;
+  kfilm->pass_bake_object = PASS_UNUSED;
 
   /* Mark passes as unused so that the kernel knows the pass is inaccessible. */
   kfilm->pass_denoising_albedo = PASS_UNUSED;
@@ -207,6 +208,7 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
   kfilm->pass_denoising_roughness = PASS_UNUSED;
   kfilm->pass_denoising_depth = PASS_UNUSED;
   kfilm->pass_denoising_backward_motion = PASS_UNUSED;
+  kfilm->pass_denoising_specular_motion = PASS_UNUSED;
   kfilm->pass_sample_count = PASS_UNUSED;
   kfilm->pass_render_time = PASS_UNUSED;
   kfilm->pass_adaptive_aux_buffer = PASS_UNUSED;
@@ -245,7 +247,8 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
 
     /* Can't do motion pass if no motion vectors are available. */
     if (pass->get_type() == PASS_MOTION || pass->get_type() == PASS_MOTION_WEIGHT ||
-        pass->get_type() == PASS_DENOISING_BACKWARD_MOTION)
+        pass->get_type() == PASS_DENOISING_BACKWARD_MOTION ||
+        pass->get_type() == PASS_DENOISING_SPECULAR_MOTION)
     {
       const Scene::MotionType need_motion = scene->need_motion();
       if (need_motion != Scene::MOTION_PASS && need_motion != Scene::MOTION_PASS_INTERACTIVE) {
@@ -377,6 +380,9 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
       case PASS_BAKE_DIFFERENTIAL:
         kfilm->pass_bake_differential = kfilm->pass_stride;
         break;
+      case PASS_BAKE_OBJECT:
+        kfilm->pass_bake_object = kfilm->pass_stride;
+        break;
 
       case PASS_CRYPTOMATTE:
         kfilm->pass_cryptomatte = have_cryptomatte ?
@@ -402,6 +408,9 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
         break;
       case PASS_DENOISING_BACKWARD_MOTION:
         kfilm->pass_denoising_backward_motion = kfilm->pass_stride;
+        break;
+      case PASS_DENOISING_SPECULAR_MOTION:
+        kfilm->pass_denoising_specular_motion = kfilm->pass_stride;
         break;
 
       case PASS_SHADOW_CATCHER:
@@ -585,11 +594,11 @@ void Film::update_passes(Scene *scene)
     if (denoiser_passes & DENOISER_PASS_DEPTH) {
       add_auto_pass(scene, PASS_DENOISING_DEPTH);
     }
-    if (denoiser_passes & DENOISER_PASS_MOTION) {
-      add_auto_pass(scene, PASS_MOTION);
-    }
     if (denoiser_passes & DENOISER_PASS_BACKWARD_MOTION) {
       add_auto_pass(scene, PASS_DENOISING_BACKWARD_MOTION);
+    }
+    if (denoiser_passes & DENOISER_PASS_SPECULAR_MOTION) {
+      add_auto_pass(scene, PASS_DENOISING_SPECULAR_MOTION);
     }
   }
 
@@ -667,7 +676,8 @@ void Film::update_passes(Scene *scene)
   /* Flush scene updates. */
   const bool have_uv_pass = Pass::contains(scene->passes, PASS_UV);
   const bool have_motion_pass = Pass::contains(scene->passes, PASS_MOTION) ||
-                                Pass::contains(scene->passes, PASS_DENOISING_BACKWARD_MOTION);
+                                Pass::contains(scene->passes, PASS_DENOISING_BACKWARD_MOTION) ||
+                                Pass::contains(scene->passes, PASS_DENOISING_SPECULAR_MOTION);
   const bool have_ao_pass = Pass::contains(scene->passes, PASS_AO);
 
   if (have_uv_pass != prev_have_uv_pass) {
@@ -802,9 +812,9 @@ void Film::finalize_passes(Scene *scene, const bool use_denoise)
   scene->passes = std::move(new_passes);
 }
 
-uint Film::get_kernel_features(const Scene *scene) const
+uint64_t Film::get_kernel_features(const Scene *scene) const
 {
-  uint kernel_features = 0;
+  uint64_t kernel_features = 0;
 
   for (const Pass *pass : scene->passes) {
     if (!pass->is_written()) {
@@ -818,7 +828,7 @@ uint Film::get_kernel_features(const Scene *scene) const
                                   !is_volume_guiding_pass(pass_type);
 
     if (has_denoise_pass ||
-        (pass_type >= PASS_DENOISING_ALBEDO && pass_type <= PASS_DENOISING_BACKWARD_MOTION))
+        (pass_type >= PASS_DENOISING_ALBEDO && pass_type <= PASS_DENOISING_SPECULAR_MOTION))
     {
       kernel_features |= KERNEL_FEATURE_DENOISING;
     }

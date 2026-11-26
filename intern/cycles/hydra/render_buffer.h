@@ -9,12 +9,18 @@
 
 #include <pxr/imaging/hd/renderBuffer.h>
 
+#include <mutex>
+
 HDCYCLES_NAMESPACE_OPEN_SCOPE
 
 class HdCyclesRenderBuffer final : public PXR_NS::HdRenderBuffer {
  public:
   HdCyclesRenderBuffer(const PXR_NS::SdfPath &bprimId);
   ~HdCyclesRenderBuffer() override;
+
+  void Sync(PXR_NS::HdSceneDelegate *sceneDelegate,
+            PXR_NS::HdRenderParam *renderParam,
+            PXR_NS::HdDirtyBits *dirtyBits) override;
 
   void Finalize(PXR_NS::HdRenderParam *renderParam) override;
 
@@ -61,6 +67,12 @@ class HdCyclesRenderBuffer final : public PXR_NS::HdRenderBuffer {
 
   bool IsResourceUsed() const;
 
+  // Whether a resource (the display driver's texture) is set; Houdini reads the pixels otherwise
+  bool HasResource() const
+  {
+    return _hasResource;
+  }
+
   PXR_NS::VtValue GetResource(bool multiSampled = false) const override;
 
   void SetResource(const PXR_NS::VtValue &resource);
@@ -71,6 +83,13 @@ class HdCyclesRenderBuffer final : public PXR_NS::HdRenderBuffer {
                    const int channels,
                    bool isId = false);
 
+  /* The Cycles session thread writes the pixels while Hydra allocates and maps the buffer on
+   * its own threads: hold this while reading the size and writing the data. */
+  std::unique_lock<std::recursive_mutex> LockData()
+  {
+    return std::unique_lock(_dataMutex);
+  }
+
  private:
   void _Deallocate() override;
 
@@ -78,10 +97,13 @@ class HdCyclesRenderBuffer final : public PXR_NS::HdRenderBuffer {
   unsigned int _height = 0u;
   PXR_NS::HdFormat _format = PXR_NS::HdFormatInvalid;
   size_t _dataSize = 0;
+  bool _floatIds = false;
 
   std::vector<uint8_t> _data;
+  std::recursive_mutex _dataMutex;
   PXR_NS::VtValue _resource;
   mutable std::atomic_bool _resourceUsed = false;
+  std::atomic_bool _hasResource = false;
 
   std::atomic_int _mapped = 0;
   std::atomic_bool _converged = false;

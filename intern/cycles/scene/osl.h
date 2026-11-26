@@ -51,6 +51,8 @@ struct OSLShaderInfo {
   bool has_surface_emission = false;
   bool has_surface_transparent = false;
   bool has_surface_bssrdf = false;
+  /* Attributes read with getattribute(): (string parameter or empty, name or its default). */
+  vector<pair<ustring, ustring>> attributes;
 };
 
 #endif
@@ -70,6 +72,7 @@ class OSLManager {
                           Progress &progress,
                           const bool reload_kernels);
   void device_free(Device *device, DeviceScene *dscene, Scene *scene);
+  void free_textures(Scene *scene);
 
 #ifdef WITH_OSL
   /* osl compile and query */
@@ -226,6 +229,7 @@ class OSLCompiler {
   OSL::ShaderGroupRef current_group;
 
   map<LayerParam, LayerParam> remapped_outputs_;
+  vector<ustring> textures_;
 #endif
 
   Device *device;

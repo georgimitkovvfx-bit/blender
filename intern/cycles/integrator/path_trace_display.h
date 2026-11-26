@@ -28,6 +28,9 @@ class PathTraceDisplay {
   explicit PathTraceDisplay(unique_ptr<DisplayDriver> driver);
   virtual ~PathTraceDisplay() = default;
 
+  /* Reset the display update pending state. Is called from the main thread immediately when
+   * requesting a session reset. */
+  void reset();
   /* Reset the display for the new state of render session. Is called whenever session is reset,
    * which happens on changes like viewport navigation or viewport dimension change.
    *
@@ -48,6 +51,12 @@ class PathTraceDisplay {
    *
    * The texture width and height denotes an actual resolution of the underlying render result. */
   bool update_begin(const int texture_width, const int texture_height);
+
+  /* False while the display driver does not show the render: skip updates. */
+  bool update_needed() const
+  {
+    return driver_->update_needed();
+  }
 
   void update_end();
 

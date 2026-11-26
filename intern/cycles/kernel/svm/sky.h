@@ -89,9 +89,9 @@ ccl_device float sky_radiance_internal(const ccl_private float *configuration,
 
   const float expM = expf(configuration[4] * gamma);
   const float rayM = cgamma * cgamma;
-  const float mieM = (1.0f + rayM) / powf((1.0f + configuration[8] * configuration[8] -
-                                           2.0f * configuration[8] * cgamma),
-                                          1.5f);
+  const float mieBase = 1.0f + configuration[8] * configuration[8] -
+                        2.0f * configuration[8] * cgamma;
+  const float mieM = (1.0f + rayM) / (mieBase * sqrtf(mieBase));
   const float zenith = sqrtf(ctheta);
 
   return (1.0f + configuration[0] * expf(configuration[1] / (ctheta + 0.01f))) *
@@ -176,7 +176,8 @@ ccl_device float3 sky_radiance_nishita(KernelGlobals kg,
   const float x = fractf((-direction.y - M_PI_2_F + sun_rotation) * M_1_2PI_F);
   /* Undo the non-linear transformation from the sky LUT */
   const float y = copysignf(sqrtf(fabsf(dir_elevation) * M_2_PI_F), dir_elevation) * 0.5f + 0.5f;
-  xyz += make_float3(kernel_image_interp(kg, sd, texture_id, dual2(make_float2(x, y))));
+  xyz += make_float3(
+      kernel_image_interp(kg, sd, texture_id, dual2(make_float2(x, y)), IMAGE_MISSING_RGBA));
 
   /* Convert to RGB */
   return xyz_to_rgb_clamped(kg, xyz);
